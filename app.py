@@ -19,7 +19,14 @@ from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassifica
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
-import spacy
+
+# Optional spaCy import with error handling
+try:
+    import spacy
+    SPACY_AVAILABLE = True
+except ImportError:
+    SPACY_AVAILABLE = False
+    spacy = None
 
 # File processing imports
 import openpyxl
@@ -152,6 +159,72 @@ class DataProcessor:
     
     @staticmethod
     @st.cache_data(show_spinner=False)
+    def process_file(file_content: bytes, filename: str) -> Optional[pd.DataFrame]:
+        """Process different file types (Excel, CSV, Text)"""
+        try:
+            file_extension = filename.lower().split('.')[-1]
+            
+            if file_extension in ['xlsx', 'xls']:
+                return DataProcessor.excel_to_parquet(file_content, filename)
+            elif file_extension == 'csv':
+                return DataProcessor.csv_to_dataframe(file_content, filename)
+            elif file_extension == 'txt':
+                return DataProcessor.txt_to_dataframe(file_content, filename)
+            else:
+                raise ValueError(f"Unsupported file type: {file_extension}")
+        except Exception as e:
+            logger.error(f"Error processing file {filename}: {str(e)}")
+            raise e
+    
+    @staticmethod
+    def csv_to_dataframe(file_content: bytes, filename: str) -> pd.DataFrame:
+        """Convert CSV to DataFrame"""
+        try:
+            df = pd.read_csv(io.BytesIO(file_content))
+            
+            # Basic data validation
+            if df.empty:
+                raise ValueError("CSV file is empty")
+            
+            # Detect and map columns
+            column_mapping = DataProcessor._detect_columns(df)
+            if column_mapping:
+                df = df.rename(columns=column_mapping)
+            
+            # Clean and preprocess data
+            df = DataProcessor._clean_dataframe(df)
+            
+            logger.info(f"Successfully processed CSV file: {filename}")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error processing CSV file {filename}: {str(e)}")
+            raise e
+    
+    @staticmethod
+    def txt_to_dataframe(file_content: bytes, filename: str) -> pd.DataFrame:
+        """Convert text file to DataFrame (one transcript per line)"""
+        try:
+            text_content = file_content.decode('utf-8')
+            lines = [line.strip() for line in text_content.split('\n') if line.strip()]
+            
+            if not lines:
+                raise ValueError("Text file is empty")
+            
+            # Create DataFrame with transcript column
+            df = pd.DataFrame({'transcript': lines})
+            
+            # Clean and preprocess data
+            df = DataProcessor._clean_dataframe(df)
+            
+            logger.info(f"Successfully processed text file: {filename}")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error processing text file {filename}: {str(e)}")
+            raise e
+    @staticmethod
+    @st.cache_data(show_spinner=False)
     def excel_to_parquet(file_content: bytes, filename: str) -> Optional[pd.DataFrame]:
         """Convert Excel file to DataFrame efficiently"""
         try:
@@ -246,16 +319,23 @@ class NLPAnalyzer:
                 return_all_scores=True
             )
             
-            # Initialize spaCy model
-            try:
-                _self.nlp = spacy.load("en_core_web_sm")
-            except OSError:
-                st.warning("spaCy model not found. Using basic NLP features.")
-                _self.nlp = None
+            # Initialize spaCy model only if available
+            _self.nlp = None
+            if SPACY_AVAILABLE:
+                try:
+                    _self.nlp = spacy.load("en_core_web_sm")
+                    st.success("✅ spaCy model loaded successfully!")
+                except OSError:
+                    st.info("ℹ️ spaCy model not found. Using basic NLP features.")
+                except Exception as spacy_error:
+                    st.warning(f"⚠️ spaCy initialization failed: {str(spacy_error)}. Using basic NLP features.")
+            else:
+                st.info("ℹ️ spaCy not available. Using basic NLP features.")
             
             return True
         except Exception as e:
             logger.error(f"Error initializing NLP models: {str(e)}")
+            st.error(f"❌ Model initialization failed: {str(e)}")
             return False
     
     def analyze_sentiment(self, text: str) -> Dict[str, float]:
@@ -435,20 +515,20 @@ class CallAnalyticsApp:
         </div>
         """, unsafe_allow_html=True)
         
-        # Main tabs
+        # Main tabs - Updated sequence
         tabs = st.tabs([
+            "📤 Upload & Process",
             "🏠 Dashboard", 
-            "📤 Upload & Process", 
             "⚙️ Configuration", 
             "📊 Results & Analytics",
             "📖 User Guide"
         ])
         
         with tabs[0]:
-            self._render_dashboard()
+            self._render_upload_process()
         
         with tabs[1]:
-            self._render_upload_process()
+            self._render_dashboard()
         
         with tabs[2]:
             self._render_configuration()
@@ -556,11 +636,11 @@ class CallAnalyticsApp:
         col1, col2 = st.columns([2, 1])
         
         with col1:
-            # File upload
+            # File upload - Updated to accept CSV and text files
             uploaded_file = st.file_uploader(
-                "Choose Excel file containing call transcripts",
-                type=['xlsx', 'xls'],
-                help="Upload Excel files up to 500MB. Ensure your file contains transcript data."
+                "Choose file containing call transcripts",
+                type=['xlsx', 'xls', 'csv', 'txt'],
+                help="Upload Excel, CSV, or text files up to 500MB. Ensure your file contains transcript data."
             )
             
             if uploaded_file:
@@ -596,10 +676,10 @@ class CallAnalyticsApp:
             status_text = st.empty()
             
             # Step 1: File conversion
-            status_text.text("📄 Converting Excel to Parquet format...")
+            status_text.text("📄 Processing file...")
             progress_bar.progress(10)
             
-            df = self.processor.excel_to_parquet(
+            df = self.processor.process_file(
                 uploaded_file.getvalue(), 
                 uploaded_file.name
             )
@@ -1104,16 +1184,17 @@ class CallAnalyticsApp:
             ## 🚀 Getting Started with Call Analytics Pro
             
             ### Step 1: Prepare Your Data
-            - **File Format**: Excel files (.xlsx, .xls) up to 500MB
-            - **Required Columns**: The app will automatically detect columns containing:
+            - **Supported Formats**: Excel (.xlsx, .xls), CSV (.csv), and Text (.txt) files up to 500MB
+            - **Excel/CSV Files**: The app will automatically detect columns containing:
               - Call transcripts/conversation text
               - Agent/representative information
-              - Customer/caller information
+              - Customer/caller information  
               - Date/timestamp (optional)
+            - **Text Files**: Should contain one call transcript per line
             
             ### Step 2: Upload and Process
-            1. Go to the **Upload & Process** tab
-            2. Click "Choose Excel file" and select your transcript file
+            1. Go to the **Upload & Process** tab (first tab)
+            2. Click "Choose file" and select your transcript file (Excel, CSV, or Text)
             3. Click "🚀 Start Analysis" to begin processing
             4. Monitor the progress bar and status updates
             
@@ -1217,14 +1298,16 @@ class CallAnalyticsApp:
             #### "Failed to process file" Error
             **Possible Causes:**
             - File is corrupted or password protected
-            - Unsupported Excel format
-            - No transcript data detected
+            - Unsupported file format
+            - No transcript data detected (for Excel/CSV)
+            - Empty file
             
             **Solutions:**
-            - Re-save file as .xlsx format
+            - Re-save file in supported format (.xlsx, .csv, .txt)
             - Remove password protection
             - Ensure transcript columns contain text data
             - Check file size (max 500MB)
+            - For text files, ensure one transcript per line
             
             #### "No analysis results available" Message
             **Cause:** Processing hasn't been completed or failed
@@ -1278,7 +1361,13 @@ class CallAnalyticsApp:
             ### General Questions
             
             **Q: What file formats are supported?**
-            A: Excel files (.xlsx and .xls) up to 500MB in size.
+            A: Excel files (.xlsx, .xls), CSV files (.csv), and text files (.txt) up to 500MB in size.
+            
+            **Q: How should I format my data?**
+            A: 
+            - **Excel/CSV**: Include columns for transcripts, agent info, customer info, and dates
+            - **Text files**: One call transcript per line
+            - **All formats**: Ensure transcript text is clean and readable
             
             **Q: How long does processing take?**
             A: Processing time varies by file size. Typical times:

@@ -1,17 +1,17 @@
-# Core Streamlit and Web Framework
+# Core Streamlit and UI
 streamlit>=1.28.0
 streamlit-option-menu>=0.3.6
+streamlit-lottie>=0.1.8        # optional, add if you want Lottie animations
 
-# Data Processing and Analysis
+# Data Processing and IO
 pandas>=2.1.0
 numpy>=1.24.0
 pyarrow>=13.0.0
 openpyxl>=3.1.0
 
-# Machine Learning and NLP
+# Machine Learning & NLP
 scikit-learn>=1.3.0
 transformers>=4.35.0
-torch>=2.1.0
 tokenizers>=0.15.0
 nltk>=3.8.1
 textblob>=0.17.1
@@ -19,24 +19,27 @@ spacy>=3.7.0
 
 # Visualization
 plotly>=5.17.0
-matplotlib>=3.7.0
-seaborn>=0.12.0
+# matplotlib>=3.7.0     # optional (only if you use matplotlib)
+# seaborn>=0.12.0       # optional
 
-# PDF Generation
+# PDF generation / Reports
 reportlab>=4.0.0
 
-# Utilities
+# Utilities & networking
 python-dateutil>=2.8.0
 pytz>=2023.3
 requests>=2.31.0
 urllib3>=2.0.0
 
-# spaCy Models
-https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.0/en_core_web_sm-3.7.0-py3-none-any.whl
+# Optional / performance
+# fastparquet>=2023.8.0    # optional alternative to pyarrow
+# numba>=0.58.0            # optional acceleration
 
-# Optional: For enhanced performance
-numba>=0.58.0
-fastparquet>=2023.8.0
+# NOTE: Torch is environment-specific. Choose appropriate wheel for CPU or CUDA.
+# Examples:
+# CPU-only (recommended for many servers): pip install torch --index-url https://download.pytorch.org/whl/cpu
+# or add a placeholder below and install manually per environment:
+# torch>=2.1.0
 
-# Development and Logging
-logging>=0.4.9.6
+# spaCy model (install separately after creating venv)
+# pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.0/en_core_web_sm-3.7.0-py3-none-any.whl

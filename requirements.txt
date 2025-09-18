@@ -1,10 +1,85 @@
-streamlit>=1.28.0
+# Optimized GenCoachingIQ Requirements with Multiple Sentiment Options
+# Core data processing
 pandas>=2.0.0
 numpy>=1.24.0
+
+# File processing
+openpyxl>=3.1.0
+
+# NLP - Multiple sentiment analysis options
+# VADER - Fast and accurate for social media/conversational text
+vaderSentiment>=3.3.2
+
+# TextBlob - General purpose sentiment analysis
+textblob>=0.17.1
+
+# Transformers - Most accurate but slowest (optional)
 transformers>=4.30.0
 torch>=2.0.0
-textblob>=0.17.1
+tokenizers>=0.13.0
+
+# Machine Learning for theme extraction
 scikit-learn>=1.3.0
-plotly>=5.15.0
-openpyxl>=3.1.0
+
+# High-performance data processing
 pyarrow>=12.0.0
+
+# Streamlit for web interface
+streamlit>=1.28.0
+
+# Visualizations
+plotly>=5.15.0# Optimized GenCoachingIQ Requirements for Fast Processing
+# Core data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# File processing
+openpyxl>=3.1.0
+
+# NLP - Advanced with batch processing
+transformers>=4.30.0
+torch>=2.0.0
+tokenizers>=0.13.0
+
+# NLP - Fallback
+textblob>=0.17.1
+
+# Machine Learning for theme extraction
+scikit-learn>=1.3.0
+
+# High-performance data processing (recommended for large files)
+pyarrow>=12.0.0
+
+# Streamlit for web interface
+streamlit>=1.28.0
+
+# Visualizations
+plotly>=5.15.0# Minimal GenCoachingIQ Requirements
+# Core data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# File processing
+openpyxl>=3.1.0
+
+# NLP - Advanced (optional but recommended)
+transformers>=4.30.0
+torch>=2.0.0
+tokenizers>=0.13.0
+
+# NLP - Fallback
+textblob>=0.17.1
+
+# Machine Learning for theme extraction
+scikit-learn>=1.3.0
+
+# High-performance data processing (optional but recommended for large files)
+pyarrow>=12.0.0
+
+# Standard library dependencies (usually included with Python)
+# json (built-in)
+# re (built-in) 
+# logging (built-in)
+# datetime (built-in)
+# argparse (built-in)
+# io (built-in)

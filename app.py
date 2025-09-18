@@ -4,9 +4,10 @@ import numpy as np
 from pathlib import Path
 import io
 import json
+import re
 from datetime import datetime, timedelta
 import logging
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 import asyncio
 import plotly.express as px
 import plotly.graph_objects as go
@@ -37,17 +38,54 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib import colors
 
+# Lottie animations
+from streamlit_lottie import st_lottie
+import requests
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Page configuration
 st.set_page_config(
-    page_title="Call Analytics Pro",
-    page_icon="📞",
+    page_title="GenCoachingIQ",
+    page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Lottie Animation Loader
+@st.cache_data
+def load_lottie_url(url: str):
+    """Load Lottie animation from URL"""
+    try:
+        r = requests.get(url)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except:
+        return None
+
+# Lottie animation URLs
+LOTTIE_URLS = {
+    'upload': 'https://lottie.host/4d7e3d13-ae8b-4b5d-8c9d-2e5f7a8b9c0d/animation.json',
+    'processing': 'https://lottie.host/embed/af21f5e9-f62f-4d9d-9e4c-1a2b3c4d5e6f/animation.json',
+    'success': 'https://lottie.host/embed/b7f3d2e8-c4a1-4f5b-9d8e-3f2a1b0c9d8e/animation.json',
+    'analytics': 'https://lottie.host/embed/c8e4f3d9-a5b2-4e6c-8f9a-4d3e2f1b0a9c/animation.json'
+}
+
+# Fallback animations (simple JSON for offline use)
+FALLBACK_ANIMATIONS = {
+    'upload': {"v": "5.5.7", "fr": 60, "ip": 0, "op": 60, "w": 200, "h": 200, "nm": "upload", "ddd": 0, "assets": [], "layers": []},
+    'processing': {"v": "5.5.7", "fr": 60, "ip": 0, "op": 120, "w": 200, "h": 200, "nm": "processing", "ddd": 0, "assets": [], "layers": []},
+    'success': {"v": "5.5.7", "fr": 60, "ip": 0, "op": 90, "w": 200, "h": 200, "nm": "success", "ddd": 0, "assets": [], "layers": []},
+    'analytics': {"v": "5.5.7", "fr": 60, "ip": 0, "op": 150, "w": 200, "h": 200, "nm": "analytics", "ddd": 0, "assets": [], "layers": []}
+}
+
+def get_lottie_animation(animation_type: str):
+    """Get Lottie animation with fallback"""
+    animation = load_lottie_url(LOTTIE_URLS.get(animation_type))
+    return animation if animation else FALLBACK_ANIMATIONS.get(animation_type)
 
 # Custom CSS for professional styling
 st.markdown("""
@@ -154,8 +192,152 @@ class CallAnalyticsConfig:
         """Save configuration to session state"""
         st.session_state.app_config = config
 
+class EnhancedTranscriptProcessor:
+    """Enhanced preprocessing for timestamped conversation analysis"""
+    
+    @staticmethod
+    def parse_timestamped_transcript(transcript: str) -> Dict[str, any]:
+        """Parse transcript with timestamps and speaker identification"""
+        try:
+            # Regex patterns for different timestamp formats
+            patterns = [
+                r'\[(\d{1,2}:\d{2}:\d{2})\s+(AGENT|CUSTOMER|REPRESENTATIVE|CALLER)\]:\s*(.*?)(?=\[|\Z)',
+                r'\[(\d{1,2}:\d{2}:\d{2})\]\s+(AGENT|CUSTOMER|REPRESENTATIVE|CALLER):\s*(.*?)(?=\[|\Z)',
+                r'(\d{1,2}:\d{2}:\d{2})\s+(AGENT|CUSTOMER|REPRESENTATIVE|CALLER):\s*(.*?)(?=\d{1,2}:\d{2}:\d{2}|\Z)'
+            ]
+            
+            conversation_turns = []
+            full_agent_text = []
+            full_customer_text = []
+            
+            for pattern in patterns:
+                matches = re.findall(pattern, transcript, re.IGNORECASE | re.DOTALL)
+                if matches:
+                    for timestamp_str, speaker, content in matches:
+                        # Convert timestamp to seconds for analysis
+                        time_parts = timestamp_str.split(':')
+                        total_seconds = int(time_parts[0]) * 3600 + int(time_parts[1]) * 60 + int(time_parts[2])
+                        
+                        # Normalize speaker labels
+                        speaker_normalized = 'AGENT' if speaker.upper() in ['AGENT', 'REPRESENTATIVE'] else 'CUSTOMER'
+                        
+                        # Clean content
+                        content_clean = content.strip()
+                        if content_clean:
+                            turn_data = {
+                                'timestamp': timestamp_str,
+                                'seconds': total_seconds,
+                                'speaker': speaker_normalized,
+                                'content': content_clean,
+                                'word_count': len(content_clean.split()),
+                                'char_count': len(content_clean)
+                            }
+                            conversation_turns.append(turn_data)
+                            
+                            # Collect speaker-specific text
+                            if speaker_normalized == 'AGENT':
+                                full_agent_text.append(content_clean)
+                            else:
+                                full_customer_text.append(content_clean)
+                    break  # Use first successful pattern
+            
+            # If no timestamped format found, treat as single transcript
+            if not conversation_turns:
+                return {
+                    'turns': [],
+                    'agent_text': transcript,
+                    'customer_text': '',
+                    'total_duration': 0,
+                    'turn_count': 0,
+                    'has_timestamps': False
+                }
+            
+            # Calculate conversation metrics
+            total_duration = conversation_turns[-1]['seconds'] if conversation_turns else 0
+            
+            return {
+                'turns': conversation_turns,
+                'agent_text': ' '.join(full_agent_text),
+                'customer_text': ' '.join(full_customer_text),
+                'total_duration': total_duration,
+                'turn_count': len(conversation_turns),
+                'has_timestamps': True
+            }
+            
+        except Exception as e:
+            logger.error(f"Timestamp parsing error: {str(e)}")
+            return {
+                'turns': [],
+                'agent_text': transcript,
+                'customer_text': '',
+                'total_duration': 0,
+                'turn_count': 0,
+                'has_timestamps': False
+            }
+    
+    @staticmethod
+    def analyze_conversation_flow(parsed_transcript: Dict) -> Dict[str, any]:
+        """Analyze sentiment and theme progression throughout conversation"""
+        if not parsed_transcript.get('has_timestamps') or not parsed_transcript.get('turns'):
+            return {'flow_analysis': [], 'sentiment_progression': [], 'key_moments': []}
+        
+        turns = parsed_transcript['turns']
+        flow_analysis = []
+        sentiment_scores = []
+        key_moments = []
+        
+        # Initialize NLP analyzer for turn-by-turn analysis
+        analyzer = NLPAnalyzer()
+        
+        for i, turn in enumerate(turns):
+            content = turn['content']
+            
+            # Sentiment analysis for this turn
+            sentiment = analyzer.analyze_sentiment(content)
+            primary_sentiment = max(sentiment, key=sentiment.get)
+            sentiment_score = sentiment.get(primary_sentiment, 0)
+            
+            # Theme extraction for substantial turns (>10 words)
+            themes = []
+            if turn['word_count'] > 10:
+                themes = analyzer.extract_themes([content], n_themes=2)
+            
+            turn_analysis = {
+                'turn_index': i,
+                'timestamp': turn['timestamp'],
+                'seconds': turn['seconds'],
+                'speaker': turn['speaker'],
+                'sentiment': primary_sentiment,
+                'sentiment_score': sentiment_score,
+                'sentiment_scores': sentiment,
+                'themes': themes,
+                'word_count': turn['word_count']
+            }
+            
+            flow_analysis.append(turn_analysis)
+            sentiment_scores.append(sentiment_score if primary_sentiment == 'positive' else -sentiment_score if primary_sentiment == 'negative' else 0)
+            
+            # Identify key moments (sentiment shifts >0.3)
+            if i > 0:
+                prev_score = sentiment_scores[i-1]
+                current_score = sentiment_scores[i]
+                if abs(current_score - prev_score) > 0.3:
+                    key_moments.append({
+                        'timestamp': turn['timestamp'],
+                        'type': 'sentiment_shift',
+                        'from_sentiment': flow_analysis[i-1]['sentiment'],
+                        'to_sentiment': primary_sentiment,
+                        'speaker': turn['speaker'],
+                        'content_preview': content[:100] + "..." if len(content) > 100 else content
+                    })
+        
+        return {
+            'flow_analysis': flow_analysis,
+            'sentiment_progression': sentiment_scores,
+            'key_moments': key_moments
+        }
 class DataProcessor:
-    """Handles file processing and data conversion"""
+    """Handles file processing and data conversion with enhanced preprocessing"""
     
     @staticmethod
     @st.cache_data(show_spinner=False)
@@ -510,8 +692,8 @@ class CallAnalyticsApp:
         # Header
         st.markdown("""
         <div class="main-header">
-            <h1>📞 Call Analytics Pro</h1>
-            <p>Advanced ML-powered Call Transcript Analysis & Coaching Insights</p>
+            <h1>🧠 GenCoachingIQ</h1>
+            <p>AI-Powered Conversation Analytics & Intelligent Coaching Insights</p>
         </div>
         """, unsafe_allow_html=True)
         
@@ -636,12 +818,21 @@ class CallAnalyticsApp:
         col1, col2 = st.columns([2, 1])
         
         with col1:
-            # File upload - Updated to accept CSV and text files
-            uploaded_file = st.file_uploader(
-                "Choose file containing call transcripts",
-                type=['xlsx', 'xls', 'csv', 'txt'],
-                help="Upload Excel, CSV, or text files up to 500MB. Ensure your file contains transcript data."
-            )
+            # File upload with Lottie animation
+            col_upload, col_anim = st.columns([3, 1])
+            
+            with col_upload:
+                uploaded_file = st.file_uploader(
+                    "Choose file containing call transcripts",
+                    type=['xlsx', 'xls', 'csv', 'txt'],
+                    help="Upload Excel, CSV, or text files up to 500MB. Supports timestamped transcripts."
+                )
+            
+            with col_anim:
+                if uploaded_file is None:
+                    upload_animation = get_lottie_animation('upload')
+                    if upload_animation:
+                        st_lottie(upload_animation, height=100, key="upload_animation")
             
             if uploaded_file:
                 file_details = {
@@ -655,12 +846,13 @@ class CallAnalyticsApp:
         with col2:
             st.markdown("""
             <div class="config-section">
-                <h4>📋 Processing Options</h4>
-                <p>• Automatic column detection</p>
-                <p>• Sentiment analysis</p>
-                <p>• NPS prediction</p>
-                <p>• Compliance checking</p>
-                <p>• Theme extraction</p>
+                <h4>🧠 Enhanced Processing</h4>
+                <p>• Timestamped conversation analysis</p>
+                <p>• Turn-by-turn sentiment tracking</p>
+                <p>• Conversation flow insights</p>
+                <p>• Critical moment identification</p>
+                <p>• Speaker-specific analysis</p>
+                <p>• Smart coaching recommendations</p>
             </div>
             """, unsafe_allow_html=True)
         
@@ -670,12 +862,20 @@ class CallAnalyticsApp:
                 self._process_file(uploaded_file)
     
     def _process_file(self, uploaded_file):
-        """Process uploaded file with progress tracking"""
+        """Process uploaded file with enhanced analysis and animations"""
         try:
+            # Show processing animation
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col2:
+                processing_animation = get_lottie_animation('processing')
+                if processing_animation:
+                    animation_placeholder = st.empty()
+                    animation_placeholder.st_lottie(processing_animation, height=200, key="processing_animation")
+            
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            # Step 1: File conversion
+            # Step 1: File processing
             status_text.text("📄 Processing file...")
             progress_bar.progress(10)
             
@@ -690,13 +890,16 @@ class CallAnalyticsApp:
             
             progress_bar.progress(25)
             
-            # Step 2: Initialize analysis
-            status_text.text("🧠 Initializing NLP models...")
-            progress_bar.progress(40)
+            # Step 2: Enhanced transcript preprocessing
+            status_text.text("🔍 Analyzing conversation structure...")
+            progress_bar.progress(35)
             
-            # Step 3: Analyze transcripts
-            status_text.text("📊 Analyzing transcripts...")
-            results = []
+            enhanced_processor = EnhancedTranscriptProcessor()
+            enhanced_results = []
+            
+            # Step 3: Process each transcript with enhanced analysis
+            status_text.text("🧠 Performing advanced conversation analysis...")
+            progress_bar.progress(50)
             
             total_rows = len(df)
             for idx, row in df.iterrows():
@@ -705,34 +908,212 @@ class CallAnalyticsApp:
                 if len(transcript.strip()) == 0:
                     continue
                 
-                # Sentiment analysis
+                # Enhanced preprocessing
+                parsed_transcript = enhanced_processor.parse_timestamped_transcript(transcript)
+                flow_analysis = enhanced_processor.analyze_conversation_flow(parsed_transcript)
+                
+                # Traditional analysis
                 sentiment_scores = self.nlp_analyzer.analyze_sentiment(transcript)
                 primary_sentiment = max(sentiment_scores, key=sentiment_scores.get)
-                
-                # NPS calculation
                 nps_score = self.nlp_analyzer.calculate_nps_score(sentiment_scores, self.config)
-                
-                # Compliance check
                 compliance_result = self.nlp_analyzer.check_compliance(
-                    transcript, 
-                    self.config['compliance_keywords']
+                    transcript, self.config['compliance_keywords']
                 )
                 
-                # Store results
+                # Enhanced insights
+                key_insights = self._generate_coaching_insights(
+                    parsed_transcript, flow_analysis, sentiment_scores
+                )
+                
+                # Store comprehensive results
                 result = {
                     'id': row.get('id', idx + 1),
                     'transcript': transcript[:200] + "..." if len(transcript) > 200 else transcript,
                     'agent': row.get('agent', 'Unknown'),
                     'customer': row.get('customer', 'Unknown'),
                     'date': row.get('date', datetime.now()),
+                    
+                    # Traditional metrics
                     'sentiment_positive': sentiment_scores.get('positive', 0),
                     'sentiment_neutral': sentiment_scores.get('neutral', 0),
                     'sentiment_negative': sentiment_scores.get('negative', 0),
                     'primary_sentiment': primary_sentiment,
                     'nps_score': nps_score,
                     'compliance_score': compliance_result['score'],
-                    'compliance_keywords_found': ', '.join(compliance_result['found_keywords']),
-                    'compliance_keywords_missing': ', '.join(compliance_result['missing_keywords']),
+                    
+                    # Enhanced conversation metrics
+                    'has_timestamps': parsed_transcript['has_timestamps'],
+                    'conversation_duration': parsed_transcript['total_duration'],
+                    'turn_count': parsed_transcript['turn_count'],
+                    'agent_talk_time': len(parsed_transcript['agent_text'].split()),
+                    'customer_talk_time': len(parsed_transcript['customer_text'].split()),
+                    
+                    # Flow analysis
+                    'sentiment_progression': str(flow_analysis['sentiment_progression']),
+                    'key_moments_count': len(flow_analysis['key_moments']),
+                    'key_moments': str(flow_analysis['key_moments'][:3]),  # Top 3 moments
+                    
+                    # Coaching insights
+                    'coaching_themes': key_insights['positive_themes'],
+                    'improvement_areas': key_insights['improvement_areas'],
+                    'critical_moments': key_insights['critical_moments'],
+                    'coaching_priority': key_insights['priority_score']
+                }
+                
+                enhanced_results.append(result)
+                
+                # Update progress
+                progress = 50 + int((idx / total_rows) * 40)
+                progress_bar.progress(progress)
+            
+            # Step 4: Final processing
+            status_text.text("📊 Generating insights and reports...")
+            progress_bar.progress(95)
+            
+            # Create comprehensive results DataFrame
+            results_df = pd.DataFrame(enhanced_results)
+            
+            # Enhanced summary statistics
+            summary_stats = self._calculate_enhanced_summary(results_df)
+            
+            # Store results
+            st.session_state.analysis_results = results_df
+            st.session_state.analysis_summary = summary_stats
+            
+            progress_bar.progress(100)
+            status_text.text("✅ Advanced analysis completed!")
+            
+            # Show success animation
+            if processing_animation:
+                animation_placeholder.empty()
+            
+            success_animation = get_lottie_animation('success')
+            if success_animation:
+                with col2:
+                    st_lottie(success_animation, height=150, key="success_animation")
+            
+            st.success(f"🎉 Successfully analyzed {len(results_df)} conversations with enhanced insights!")
+            
+            # Enhanced preview
+            with st.expander("🧠 Enhanced Analysis Preview", expanded=True):
+                # Show conversation flow for first timestamped transcript
+                timestamped_results = results_df[results_df['has_timestamps'] == True]
+                
+                if not timestamped_results.empty:
+                    st.info(f"📊 Found {len(timestamped_results)} conversations with timestamp data for enhanced analysis")
+                    
+                    # Quick stats
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        avg_duration = timestamped_results['conversation_duration'].mean()
+                        st.metric("Avg Duration", f"{avg_duration/60:.1f} min")
+                    with col2:
+                        avg_turns = timestamped_results['turn_count'].mean()
+                        st.metric("Avg Turns", f"{avg_turns:.1f}")
+                    with col3:
+                        critical_moments = timestamped_results['key_moments_count'].sum()
+                        st.metric("Critical Moments", critical_moments)
+                    with col4:
+                        high_priority = len(timestamped_results[timestamped_results['coaching_priority'] > 7])
+                        st.metric("High Priority", high_priority)
+                
+                st.dataframe(results_df.head(5), use_container_width=True)
+            
+        except Exception as e:
+            st.error(f"❌ Processing failed: {str(e)}")
+            logger.error(f"Enhanced file processing error: {str(e)}")
+    
+    def _generate_coaching_insights(self, parsed_transcript: Dict, flow_analysis: Dict, sentiment_scores: Dict) -> Dict:
+        """Generate actionable coaching insights from enhanced analysis"""
+        insights = {
+            'positive_themes': [],
+            'improvement_areas': [],
+            'critical_moments': [],
+            'priority_score': 0
+        }
+        
+        try:
+            if not parsed_transcript.get('has_timestamps'):
+                return insights
+            
+            flow_data = flow_analysis.get('flow_analysis', [])
+            key_moments = flow_analysis.get('key_moments', [])
+            
+            # Identify positive interaction patterns
+            positive_agent_turns = [turn for turn in flow_data 
+                                 if turn['speaker'] == 'AGENT' and turn['sentiment'] == 'positive']
+            
+            if positive_agent_turns:
+                insights['positive_themes'] = list(set([
+                    theme for turn in positive_agent_turns 
+                    for theme in turn.get('themes', [])
+                ])[:3])
+            
+            # Identify improvement opportunities
+            negative_moments = [moment for moment in key_moments 
+                              if moment['to_sentiment'] == 'negative']
+            
+            if negative_moments:
+                insights['improvement_areas'] = [
+                    f"Sentiment declined at {moment['timestamp']} - review {moment['speaker'].lower()} approach"
+                    for moment in negative_moments[:2]
+                ]
+            
+            # Critical coaching moments
+            insights['critical_moments'] = [
+                f"{moment['timestamp']}: {moment['type']} by {moment['speaker']}"
+                for moment in key_moments[:3]
+            ]
+            
+            # Calculate priority score (1-10)
+            priority_factors = [
+                len(negative_moments) * 2,  # Negative sentiment shifts
+                (10 - sentiment_scores.get('positive', 0) * 10),  # Overall sentiment
+                min(len(key_moments), 5),  # Conversation complexity
+            ]
+            
+            insights['priority_score'] = min(10, max(1, sum(priority_factors) / len(priority_factors)))
+            
+        except Exception as e:
+            logger.error(f"Coaching insights generation error: {str(e)}")
+        
+        return insights
+    
+    def _calculate_enhanced_summary(self, results_df: pd.DataFrame) -> Dict:
+        """Calculate enhanced summary statistics"""
+        try:
+            base_summary = {
+                'total_calls': len(results_df),
+                'avg_nps': results_df['nps_score'].mean(),
+                'avg_sentiment': results_df['sentiment_positive'].mean(),
+                'compliance_rate': results_df['compliance_score'].mean(),
+                'processing_date': datetime.now()
+            }
+            
+            # Enhanced metrics
+            timestamped_calls = results_df[results_df['has_timestamps'] == True]
+            
+            enhanced_summary = {
+                'timestamped_conversations': len(timestamped_calls),
+                'avg_conversation_duration': timestamped_calls['conversation_duration'].mean() if len(timestamped_calls) > 0 else 0,
+                'avg_turn_count': timestamped_calls['turn_count'].mean() if len(timestamped_calls) > 0 else 0,
+                'total_critical_moments': timestamped_calls['key_moments_count'].sum() if len(timestamped_calls) > 0 else 0,
+                'high_priority_calls': len(results_df[results_df['coaching_priority'] > 7]),
+                'agent_customer_ratio': (timestamped_calls['agent_talk_time'].sum() / 
+                                       max(timestamped_calls['customer_talk_time'].sum(), 1)) if len(timestamped_calls) > 0 else 1
+            }
+            
+            return {**base_summary, **enhanced_summary}
+            
+        except Exception as e:
+            logger.error(f"Enhanced summary calculation error: {str(e)}")
+            return {
+                'total_calls': len(results_df),
+                'avg_nps': 0,
+                'avg_sentiment': 0,
+                'compliance_rate': 0,
+                'processing_date': datetime.now()
+            }
                 }
                 
                 results.append(result)

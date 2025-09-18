@@ -35,6 +35,19 @@ try:
 except ImportError:
     PLOTLY_AVAILABLE = False
 
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    PYARROW_AVAILABLE = True
+except ImportError:
+    PYARROW_AVAILABLE = False
+
+try:
+    import openpyxl
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -440,14 +453,35 @@ class TranscriptProcessor:
         }
 
 def load_dataframe_from_file(uploaded_file) -> Optional[pd.DataFrame]:
-    """Load DataFrame from uploaded file"""
+    """Load DataFrame from uploaded file with Parquet optimization"""
     try:
         file_extension = uploaded_file.name.lower().split('.')[-1]
         
+        # Step 1: Load data based on file type
         if file_extension in ['xlsx', 'xls']:
+            if not OPENPYXL_AVAILABLE:
+                st.error("Excel support not available. Please install openpyxl.")
+                return None
             df = pd.read_excel(uploaded_file)
         elif file_extension == 'csv':
-            df = pd.read_csv(uploaded_file)
+            # Try different encodings for robust CSV loading
+            encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252']
+            df = None
+            
+            for encoding in encodings:
+                try:
+                    content = uploaded_file.read().decode(encoding)
+                    uploaded_file.seek(0)  # Reset file pointer
+                    df = pd.read_csv(io.StringIO(content))
+                    break
+                except UnicodeDecodeError:
+                    uploaded_file.seek(0)  # Reset for next attempt
+                    continue
+            
+            if df is None:
+                st.error("Could not decode CSV file. Please check encoding.")
+                return None
+                
         elif file_extension == 'txt':
             content = uploaded_file.read().decode('utf-8')
             lines = [line.strip() for line in content.split('\n') if line.strip()]
@@ -456,7 +490,38 @@ def load_dataframe_from_file(uploaded_file) -> Optional[pd.DataFrame]:
             st.error(f"Unsupported file format: {file_extension}")
             return None
         
-        return clean_dataframe(df)
+        if df.empty:
+            st.error("File is empty or contains no valid data.")
+            return None
+        
+        # Step 2: Clean and standardize
+        df = clean_dataframe(df)
+        
+        # Step 3: Parquet optimization for large files
+        if len(df) > 1000 and PYARROW_AVAILABLE:
+            try:
+                # Convert to parquet format for optimization
+                table = pa.Table.from_pandas(df)
+                optimized_df = table.to_pandas()
+                
+                # Optimize string columns
+                string_cols = ['transcript', 'agent', 'customer']
+                for col in string_cols:
+                    if col in optimized_df.columns:
+                        optimized_df[col] = optimized_df[col].astype('string')
+                
+                # Optimize numeric columns
+                if 'id' in optimized_df.columns:
+                    optimized_df['id'] = pd.to_numeric(optimized_df['id'], downcast='integer', errors='coerce')
+                
+                st.info(f"Applied Parquet optimization for {len(df)} conversations")
+                return optimized_df
+                
+            except Exception as e:
+                st.warning(f"Parquet optimization failed: {e}, using standard format")
+                return df
+        
+        return df
         
     except Exception as e:
         st.error(f"Error loading file: {e}")
@@ -839,36 +904,71 @@ def main():
                 csv_data = csv_buffer.getvalue()
                 
                 st.download_button(
-                    label="Download CSV",
+                    label="📄 Download CSV",
                     data=csv_data,
                     file_name=f"gencoachingiq_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
-                    use_container_width=True
+                    use_container_width=True,
+                    help="CSV format optimized for Power BI and Excel"
                 )
             
             with col2:
+                # Excel Export with multiple sheets
+                if OPENPYXL_AVAILABLE:
+                    try:
+                        excel_buffer = io.BytesIO()
+                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                            # Main results sheet
+                            filtered_df.to_excel(writer, sheet_name='Analysis Results', index=False)
+                            
+                            # Summary sheet
+                            summary_data = {
+                                'total_conversations': [len(filtered_df)],
+                                'avg_nps_score': [filtered_df['nps_score'].mean()],
+                                'avg_sentiment_positive': [filtered_df['sentiment_positive'].mean()],
+                                'compliance_rate': [filtered_df['compliance_score'].mean()],
+                                'high_priority_count': [len(filtered_df[filtered_df['coaching_priority'] > 7])],
+                                'timestamped_conversations': [len(filtered_df[filtered_df['has_timestamps'] == True])],
+                                'processing_date': [datetime.now()]
+                            }
+                            summary_df = pd.DataFrame(summary_data)
+                            summary_df.to_excel(writer, sheet_name='Summary', index=False)
+                            
+                            # Metadata sheet
+                            metadata = {
+                                'Export Date': [datetime.now()],
+                                'Total Records': [len(filtered_df)],
+                                'Enhanced Records': [len(filtered_df[filtered_df['has_timestamps'] == True])],
+                                'Data Columns': [len(filtered_df.columns)]
+                            }
+                            metadata_df = pd.DataFrame(metadata)
+                            metadata_df.to_excel(writer, sheet_name='Metadata', index=False)
+                        
+                        st.download_button(
+                            label="📊 Download Excel",
+                            data=excel_buffer.getvalue(),
+                            file_name=f"gencoachingiq_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            help="Excel with multiple sheets including summary"
+                        )
+                    except Exception as e:
+                        st.error(f"Excel export failed: {e}")
+                else:
+                    st.info("Excel export requires openpyxl package")
+            
+            with col3:
                 # JSON Export
                 json_data = filtered_df.to_json(orient='records', date_format='iso', indent=2)
                 
                 st.download_button(
-                    label="Download JSON",
+                    label="🔧 Download JSON",
                     data=json_data,
                     file_name=f"gencoachingiq_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
                     mime="application/json",
-                    use_container_width=True
+                    use_container_width=True,
+                    help="JSON format for API integration"
                 )
-            
-            with col3:
-                # Summary Stats
-                if st.button("Show Summary Stats", use_container_width=True):
-                    st.json({
-                        "total_conversations": len(filtered_df),
-                        "avg_coaching_score": float(filtered_df['nps_score'].mean()),
-                        "avg_sentiment_positive": float(filtered_df['sentiment_positive'].mean()),
-                        "compliance_rate": float(filtered_df['compliance_score'].mean()),
-                        "high_priority_count": len(filtered_df[filtered_df['coaching_priority'] > 7]),
-                        "timestamped_conversations": len(filtered_df[filtered_df['has_timestamps'] == True])
-                    })
     
     with tab3:
         st.header("User Guide")

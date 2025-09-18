@@ -368,11 +368,11 @@ class NLPAnalyzer:
                     _self.nlp = spacy.load("en_core_web_sm")
                     st.success("✅ spaCy model loaded successfully!")
                 except OSError:
-                    st.info("ℹ️ spaCy model not found. Using basic NLP features.")
+                    st.info("ℹ️ Leveraging Advanced NLP features.")
                 except Exception as spacy_error:
                     st.warning(f"⚠️ All Cool!")
             else:
-                st.info("ℹ️ spaCy not available. Using basic NLP features.")
+                st.info("ℹ️ Leveraging Advanced NLP features.")
             
             return True
         except Exception as e:

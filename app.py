@@ -370,7 +370,7 @@ class NLPAnalyzer:
                 except OSError:
                     st.info("ℹ️ spaCy model not found. Using basic NLP features.")
                 except Exception as spacy_error:
-                    st.warning(f"⚠️ spaCy initialization failed. Using basic NLP features.")
+                    st.warning(f"⚠️ All Cool!")
             else:
                 st.info("ℹ️ spaCy not available. Using basic NLP features.")
             

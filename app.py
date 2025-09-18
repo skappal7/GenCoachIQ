@@ -1114,7 +1114,7 @@ class CallAnalyticsApp:
                 'compliance_rate': 0,
                 'processing_date': datetime.now()
             }
-                }
+            
                 
                 results.append(result)
                 

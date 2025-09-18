@@ -20,10 +20,12 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 
 # Optional spaCy import with error handling
+SPACY_AVAILABLE = False
+spacy = None
 try:
     import spacy
     SPACY_AVAILABLE = True
-except ImportError:
+except (ImportError, ValueError, OSError) as e:
     SPACY_AVAILABLE = False
     spacy = None
 

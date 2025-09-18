@@ -19,14 +19,7 @@ from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassifica
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
-
-# Optional spaCy import with error handling
-try:
-    import spacy
-    SPACY_AVAILABLE = True
-except ImportError:
-    SPACY_AVAILABLE = False
-    spacy = None
+import spacy
 
 # File processing imports
 import openpyxl
@@ -43,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # Page configuration
 st.set_page_config(
-    page_title="GenCoachIQ",
+    page_title="Call Analytics Pro",
     page_icon="📞",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -253,23 +246,16 @@ class NLPAnalyzer:
                 return_all_scores=True
             )
             
-            # Initialize spaCy model only if available
-            _self.nlp = None
-            if SPACY_AVAILABLE:
-                try:
-                    _self.nlp = spacy.load("en_core_web_sm")
-                    st.success("✅ spaCy model loaded successfully!")
-                except OSError:
-                    st.info("ℹ️ spaCy model not found. Using basic NLP features.")
-                except Exception as spacy_error:
-                    st.warning(f"⚠️ spaCy initialization failed: {str(spacy_error)}. Using basic NLP features.")
-            else:
-                st.info("ℹ️ spaCy not available. Using basic NLP features.")
+            # Initialize spaCy model
+            try:
+                _self.nlp = spacy.load("en_core_web_sm")
+            except OSError:
+                st.warning("spaCy model not found. Using basic NLP features.")
+                _self.nlp = None
             
             return True
         except Exception as e:
             logger.error(f"Error initializing NLP models: {str(e)}")
-            st.error(f"❌ Model initialization failed: {str(e)}")
             return False
     
     def analyze_sentiment(self, text: str) -> Dict[str, float]:

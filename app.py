@@ -530,10 +530,35 @@ class CallCenterAnalyzer:
         return pd.DataFrame(results)
 
 def convert_to_parquet(df, filename):
-    """Convert DataFrame to Parquet format"""
+    """Convert DataFrame to Parquet format and verify conversion"""
     with st.spinner(f"Converting {filename} to Parquet format..."):
-        table = pa.Table.from_pandas(df)
-        return table
+        try:
+            # Convert to Parquet
+            table = pa.Table.from_pandas(df)
+            
+            # Verify conversion by converting back
+            df_converted = table.to_pandas()
+            
+            # Show conversion stats
+            original_size = df.memory_usage(deep=True).sum() / 1024 / 1024  # MB
+            converted_size = table.nbytes / 1024 / 1024  # MB
+            compression_ratio = (1 - converted_size/original_size) * 100 if original_size > 0 else 0
+            
+            st.success(f"✅ Parquet Conversion Complete:")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Original Size", f"{original_size:.2f} MB")
+            with col2:
+                st.metric("Parquet Size", f"{converted_size:.2f} MB") 
+            with col3:
+                st.metric("Compression", f"{compression_ratio:.1f}%")
+            
+            return table
+            
+        except Exception as e:
+            st.error(f"Parquet conversion failed: {str(e)}")
+            st.info("Proceeding with original DataFrame format")
+            return None
 
 def load_file(uploaded_file):
     """Load and convert file to DataFrame"""
@@ -550,12 +575,25 @@ def load_file(uploaded_file):
                 st.error("Unsupported file format. Please upload CSV, XLS, or XLSX files.")
                 return None
             
-            # Convert to Parquet
-            parquet_table = convert_to_parquet(df, filename)
-            df_from_parquet = parquet_table.to_pandas()
+            st.success(f"📁 File loaded successfully: {len(df)} rows, {len(df.columns)} columns")
             
-            st.success(f"✅ File loaded and converted to Parquet: {len(df_from_parquet)} rows, {len(df_from_parquet.columns)} columns")
-            return df_from_parquet
+            # Convert to Parquet and verify
+            parquet_table = convert_to_parquet(df, filename)
+            
+            if parquet_table is not None:
+                # Use Parquet version
+                df_from_parquet = parquet_table.to_pandas()
+                
+                # Verify data integrity
+                if len(df_from_parquet) == len(df) and len(df_from_parquet.columns) == len(df.columns):
+                    st.info("🎯 Using optimized Parquet format for processing")
+                    return df_from_parquet
+                else:
+                    st.warning("⚠️ Parquet conversion integrity check failed, using original format")
+                    return df
+            else:
+                # Fallback to original DataFrame
+                return df
     
     except Exception as e:
         st.error(f"Error loading file: {str(e)}")
@@ -841,33 +879,48 @@ def main():
                     turn_filter_col1, turn_filter_col2 = st.columns(2)
                     
                     with turn_filter_col1:
+                        available_speakers = ['All']
+                        if 'speaker' in turn_df.columns:
+                            available_speakers.extend(turn_df['speaker'].unique().tolist())
+                        
                         speaker_filter = st.selectbox(
                             "Filter by speaker",
-                            options=['All', 'AGENT', 'CUSTOMER']
+                            options=available_speakers,
+                            key="turn_speaker_filter"
                         )
                     
                     with turn_filter_col2:
                         turn_priority_filter = st.selectbox(
                             "Filter by turn priority",
-                            options=['All', 'Critical Turns (< -2)', 'Positive Turns (> 1)']
+                            options=['All', 'Critical Turns (< -2)', 'Positive Turns (> 1)'],
+                            key="turn_priority_filter"
                         )
                     
                     # Apply turn filters
                     filtered_turns = turn_df.copy()
+                    
+                    # Apply speaker filter
                     if speaker_filter != 'All' and 'speaker' in turn_df.columns:
                         filtered_turns = filtered_turns[filtered_turns['speaker'] == speaker_filter]
                     
-                    if 'coaching_priority' in turn_df.columns:
+                    # Apply priority filter
+                    if 'coaching_priority' in turn_df.columns and turn_priority_filter != 'All':
                         if turn_priority_filter == 'Critical Turns (< -2)':
                             filtered_turns = filtered_turns[filtered_turns['coaching_priority'] < -2]
                         elif turn_priority_filter == 'Positive Turns (> 1)':
                             filtered_turns = filtered_turns[filtered_turns['coaching_priority'] > 1]
                     
-                    st.dataframe(
-                        filtered_turns,
-                        use_container_width=True,
-                        hide_index=True
-                    )
+                    # Display filtered results with row count
+                    st.markdown(f"**Showing {len(filtered_turns)} of {len(turn_df)} turns**")
+                    
+                    if len(filtered_turns) > 0:
+                        st.dataframe(
+                            filtered_turns,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                    else:
+                        st.info("No turns match the selected filters. Try adjusting your filter criteria.")
             
             # Export options
             st.subheader("📤 Export Results")

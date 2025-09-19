@@ -94,7 +94,7 @@ class ArrowVectorizedEngine:
                     use_compliant_nested_type=True,
                     write_statistics=True,
                     use_byte_stream_split=True,
-                    compression_level=6
+                    
                 )
                 parquet_buffer.seek(0)
                 

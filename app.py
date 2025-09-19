@@ -7,6 +7,8 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 import time
+import pickle
+import hashlib
 
 # Lightweight NLP libraries
 from textblob import TextBlob
@@ -27,13 +29,21 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Initialize session state
-if 'processed_data' not in st.session_state:
-    st.session_state.processed_data = None
-if 'turn_analysis' not in st.session_state:
-    st.session_state.turn_analysis = None
-if 'file_uploaded' not in st.session_state:
-    st.session_state.file_uploaded = False
+# Initialize session state with proper caching
+def initialize_session_state():
+    """Initialize session state with caching capabilities"""
+    if 'processed_data' not in st.session_state:
+        st.session_state.processed_data = None
+    if 'turn_analysis' not in st.session_state:
+        st.session_state.turn_analysis = None
+    if 'file_uploaded' not in st.session_state:
+        st.session_state.file_uploaded = False
+    if 'file_hash' not in st.session_state:
+        st.session_state.file_hash = None
+    if 'processing_cache' not in st.session_state:
+        st.session_state.processing_cache = {}
+    if 'parquet_data' not in st.session_state:
+        st.session_state.parquet_data = None
 
 class CallCenterAnalyzer:
     def __init__(self):
@@ -451,7 +461,16 @@ class CallCenterAnalyzer:
         return turns
     
     def process_transcript(self, df, text_col, speaker_col=None, timestamp_col=None, parallel=False):
-        """Enhanced main processing function with embedded parsing"""
+        """Enhanced main processing function with embedded parsing and caching"""
+        
+        # Generate cache key
+        cache_key = hashlib.md5(f"{text_col}_{len(df)}_{df.iloc[0][text_col][:50] if len(df) > 0 else ''}".encode()).hexdigest()
+        
+        # Check cache first
+        if cache_key in st.session_state.processing_cache:
+            st.info("📋 Using cached results for faster processing")
+            return st.session_state.processing_cache[cache_key]
+        
         results = []
         
         def process_row(row):
@@ -527,42 +546,69 @@ class CallCenterAnalyzer:
                 results.append(process_row(row))
                 progress_bar.progress((i + 1) / len(df))
         
-        return pd.DataFrame(results)
+        # Create result DataFrame and cache it
+        result_df = pd.DataFrame(results)
+        st.session_state.processing_cache[cache_key] = result_df
+        
+        return result_df
+
+def get_file_hash(uploaded_file):
+    """Generate hash for uploaded file"""
+    file_content = uploaded_file.getvalue()
+    return hashlib.md5(file_content).hexdigest()
 
 def convert_to_parquet(df, filename):
-    """Convert DataFrame to Parquet format and verify conversion"""
-    with st.spinner(f"Converting {filename} to Parquet format..."):
-        try:
-            # Convert to Parquet
+    """Convert DataFrame to Parquet format with proper compression"""
+    try:
+        with st.spinner(f"Converting {filename} to Parquet format..."):
+            # Convert to PyArrow Table with compression
             table = pa.Table.from_pandas(df)
             
-            # Verify conversion by converting back
-            df_converted = table.to_pandas()
+            # Write to buffer with compression
+            parquet_buffer = BytesIO()
+            pq.write_table(table, parquet_buffer, compression='snappy')
+            parquet_buffer.seek(0)
             
-            # Show conversion stats
+            # Read back from buffer to verify
+            parquet_table = pq.read_table(parquet_buffer)
+            df_converted = parquet_table.to_pandas()
+            
+            # Calculate sizes
             original_size = df.memory_usage(deep=True).sum() / 1024 / 1024  # MB
-            converted_size = table.nbytes / 1024 / 1024  # MB
-            compression_ratio = (1 - converted_size/original_size) * 100 if original_size > 0 else 0
+            compressed_size = len(parquet_buffer.getvalue()) / 1024 / 1024  # MB
+            compression_ratio = ((original_size - compressed_size) / original_size * 100) if original_size > 0 else 0
             
-            st.success(f"✅ Parquet Conversion Complete:")
+            # Display compression results
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("Original Size", f"{original_size:.2f} MB")
             with col2:
-                st.metric("Parquet Size", f"{converted_size:.2f} MB") 
+                st.metric("Compressed Size", f"{compressed_size:.2f} MB")
             with col3:
                 st.metric("Compression", f"{compression_ratio:.1f}%")
             
-            return table
+            st.success("✅ Parquet conversion completed with Snappy compression")
             
-        except Exception as e:
-            st.error(f"Parquet conversion failed: {str(e)}")
-            st.info("Proceeding with original DataFrame format")
-            return None
+            # Store in session state
+            st.session_state.parquet_data = df_converted
+            
+            return df_converted
+            
+    except Exception as e:
+        st.error(f"Parquet conversion failed: {str(e)}")
+        st.info("Proceeding with original DataFrame")
+        return df
 
 def load_file(uploaded_file):
-    """Load and convert file to DataFrame"""
+    """Load and convert file to DataFrame with caching"""
     try:
+        # Check if file is already processed
+        file_hash = get_file_hash(uploaded_file)
+        
+        if st.session_state.file_hash == file_hash and st.session_state.parquet_data is not None:
+            st.info("📋 Using cached file data")
+            return st.session_state.parquet_data
+        
         filename = uploaded_file.name
         file_ext = filename.split('.')[-1].lower()
         
@@ -575,31 +621,24 @@ def load_file(uploaded_file):
                 st.error("Unsupported file format. Please upload CSV, XLS, or XLSX files.")
                 return None
             
-            st.success(f"📁 File loaded successfully: {len(df)} rows, {len(df.columns)} columns")
+            st.success(f"📁 File loaded: {len(df)} rows, {len(df.columns)} columns")
             
-            # Convert to Parquet and verify
-            parquet_table = convert_to_parquet(df, filename)
+            # Convert to Parquet with compression
+            df_compressed = convert_to_parquet(df, filename)
             
-            if parquet_table is not None:
-                # Use Parquet version
-                df_from_parquet = parquet_table.to_pandas()
-                
-                # Verify data integrity
-                if len(df_from_parquet) == len(df) and len(df_from_parquet.columns) == len(df.columns):
-                    st.info("🎯 Using optimized Parquet format for processing")
-                    return df_from_parquet
-                else:
-                    st.warning("⚠️ Parquet conversion integrity check failed, using original format")
-                    return df
-            else:
-                # Fallback to original DataFrame
-                return df
+            # Update session state
+            st.session_state.file_hash = file_hash
+            
+            return df_compressed if df_compressed is not None else df
     
     except Exception as e:
         st.error(f"Error loading file: {str(e)}")
         return None
 
 def main():
+    # Initialize session state
+    initialize_session_state()
+    
     st.title("📞 Call Center Agent Coaching Analytics")
     st.markdown("*Transform call transcripts into actionable coaching insights*")
     
@@ -610,7 +649,16 @@ def main():
         # Processing options
         st.subheader("Processing Options")
         parallel_processing = st.checkbox("Enable Parallel Processing", help="Faster processing for large datasets")
-        enable_cache = st.checkbox("Enable Session Cache", value=True, help="Cache results for faster re-processing")
+        
+        # Session cache indicator
+        cache_size = len(st.session_state.processing_cache)
+        st.metric("Cache Entries", cache_size)
+        if st.button("Clear Cache", help="Clear all cached processing results"):
+            st.session_state.processing_cache.clear()
+            st.session_state.parquet_data = None
+            st.session_state.file_hash = None
+            st.success("Cache cleared")
+            st.rerun()
         
         # File upload section
         st.subheader("📁 File Upload")
@@ -637,8 +685,6 @@ def main():
                 st.session_state.df = df
                 st.session_state.file_uploaded = True
                 st.session_state.last_file = uploaded_file.name
-            else:
-                st.stop()
         else:
             df = st.session_state.df
         
@@ -668,14 +714,15 @@ def main():
             with st.spinner("Processing transcripts and analyzing coaching themes..."):
                 start_time = time.time()
                 
-                # Main analysis with embedded parsing
+                # Main analysis with embedded parsing and caching
                 results_df = analyzer.process_transcript(
                     df, text_column, parallel=parallel_processing
                 )
                 
                 # Add additional columns
                 for col in additional_columns:
-                    results_df[col] = df[col]
+                    if col in df.columns:
+                        results_df[col] = df[col].reset_index(drop=True)
                 
                 processing_time = time.time() - start_time
                 
@@ -707,12 +754,8 @@ def main():
                 st.metric("Critical Issues", high_priority_count)
             
             with col5:
-                if 'total_turns' in results_df.columns:
-                    total_turns = results_df['total_turns'].sum()
-                    st.metric("Total Conversation Turns", total_turns)
-                else:
-                    total_transcripts = len(results_df)
-                    st.metric("Total Transcripts", total_transcripts)
+                total_turns = results_df['total_turns'].sum()
+                st.metric("Total Conversation Turns", total_turns)
             
             # Coaching Priority Analysis
             st.subheader("🎯 Coaching Priority Breakdown")
@@ -751,37 +794,35 @@ def main():
             # Display options
             col1, col2, col3 = st.columns(3)
             with col1:
-                default_cols = ['predicted_nps', 'coaching_priority_score', 'top_coaching_theme']
-                if 'total_turns' in results_df.columns:
-                    default_cols.insert(0, 'total_turns')
-                if 'agent_turns' in results_df.columns:
-                    default_cols.insert(1, 'agent_turns') 
-                if 'customer_turns' in results_df.columns:
-                    default_cols.insert(2, 'customer_turns')
-                
+                default_columns = ['predicted_nps', 'coaching_priority_score', 'top_coaching_theme', 'quality_score', 'total_turns']
                 show_columns = st.multiselect(
                     "Select columns to display",
                     options=results_df.columns.tolist(),
-                    default=default_cols[:5]  # Limit to first 5 defaults
+                    default=[col for col in default_columns if col in results_df.columns]
                 )
             
             with col2:
                 filter_theme = st.selectbox(
                     "Filter by coaching theme",
-                    options=['All'] + results_df['top_coaching_theme'].unique().tolist()
+                    options=['All'] + sorted(results_df['top_coaching_theme'].unique().tolist()),
+                    key="main_theme_filter"
                 )
             
             with col3:
                 priority_filter = st.selectbox(
                     "Filter by coaching priority",
-                    options=['All', 'Critical (< -2)', 'Needs Improvement (< 0)', 'Good Performance (> 2)']
+                    options=['All', 'Critical (< -2)', 'Needs Improvement (< 0)', 'Good Performance (> 2)'],
+                    key="main_priority_filter"
                 )
             
-            # Apply filters
+            # Apply filters with proper error handling
             display_df = results_df.copy()
+            
+            # Theme filter
             if filter_theme != 'All':
                 display_df = display_df[display_df['top_coaching_theme'] == filter_theme]
             
+            # Priority filter
             if priority_filter != 'All':
                 if priority_filter == 'Critical (< -2)':
                     display_df = display_df[display_df['coaching_priority_score'] < -2]
@@ -790,19 +831,29 @@ def main():
                 elif priority_filter == 'Good Performance (> 2)':
                     display_df = display_df[display_df['coaching_priority_score'] > 2]
             
+            # Apply column selection
             if show_columns:
-                display_df = display_df[show_columns]
+                available_columns = [col for col in show_columns if col in display_df.columns]
+                if available_columns:
+                    display_df = display_df[available_columns]
             
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                hide_index=True
-            )
+            # Show filter results info
+            st.info(f"Showing {len(display_df)} of {len(results_df)} transcripts")
+            
+            # Display table
+            if len(display_df) > 0:
+                st.dataframe(
+                    display_df,
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.warning("No data matches the selected filters. Please adjust your filter criteria.")
             
             # Turn-by-turn analysis
             st.subheader("🔄 Turn-by-Turn Conversation Analysis")
             
-            if st.button("Generate Turn-by-Turn Analysis"):
+            if st.button("Generate Turn-by-Turn Analysis", type="secondary"):
                 with st.spinner("Analyzing individual conversation turns..."):
                     analyzer = CallCenterAnalyzer()
                     turn_results = []
@@ -847,80 +898,70 @@ def main():
                     turn_col1, turn_col2, turn_col3, turn_col4 = st.columns(4)
                     
                     with turn_col1:
-                        if 'speaker' in turn_df.columns:
-                            agent_turns = len(turn_df[turn_df['speaker'] == 'AGENT'])
-                            st.metric("Agent Turns", agent_turns)
-                        else:
-                            st.metric("Agent Turns", 0)
+                        agent_turns = len(turn_df[turn_df['speaker'] == 'AGENT'])
+                        st.metric("Agent Turns", agent_turns)
                     
                     with turn_col2:
-                        if 'speaker' in turn_df.columns:
-                            customer_turns = len(turn_df[turn_df['speaker'] == 'CUSTOMER'])
-                            st.metric("Customer Turns", customer_turns)
-                        else:
-                            st.metric("Customer Turns", 0)
+                        customer_turns = len(turn_df[turn_df['speaker'] == 'CUSTOMER'])
+                        st.metric("Customer Turns", customer_turns)
                     
                     with turn_col3:
-                        if 'coaching_priority' in turn_df.columns:
-                            critical_turns = len(turn_df[turn_df['coaching_priority'] < -2])
-                            st.metric("Critical Turns", critical_turns)
-                        else:
-                            st.metric("Critical Turns", 0)
+                        critical_turns = len(turn_df[turn_df['coaching_priority'] < -2])
+                        st.metric("Critical Turns", critical_turns)
                     
                     with turn_col4:
-                        if 'sentiment_compound' in turn_df.columns:
-                            avg_turn_sentiment = turn_df['sentiment_compound'].mean()
-                            st.metric("Avg Turn Sentiment", f"{avg_turn_sentiment:.2f}")
-                        else:
-                            st.metric("Avg Turn Sentiment", "N/A")
-                    
-                    # Turn filtering options
-                    st.markdown("### Filter Turn Analysis")
-                    turn_filter_col1, turn_filter_col2 = st.columns(2)
-                    
-                    with turn_filter_col1:
-                        available_speakers = ['All']
-                        if 'speaker' in turn_df.columns:
-                            available_speakers.extend(turn_df['speaker'].unique().tolist())
-                        
-                        speaker_filter = st.selectbox(
-                            "Filter by speaker",
-                            options=available_speakers,
-                            key="turn_speaker_filter"
-                        )
-                    
-                    with turn_filter_col2:
-                        turn_priority_filter = st.selectbox(
-                            "Filter by turn priority",
-                            options=['All', 'Critical Turns (< -2)', 'Positive Turns (> 1)'],
-                            key="turn_priority_filter"
-                        )
-                    
-                    # Apply turn filters
-                    filtered_turns = turn_df.copy()
-                    
-                    # Apply speaker filter
-                    if speaker_filter != 'All' and 'speaker' in turn_df.columns:
-                        filtered_turns = filtered_turns[filtered_turns['speaker'] == speaker_filter]
-                    
-                    # Apply priority filter
-                    if 'coaching_priority' in turn_df.columns and turn_priority_filter != 'All':
-                        if turn_priority_filter == 'Critical Turns (< -2)':
-                            filtered_turns = filtered_turns[filtered_turns['coaching_priority'] < -2]
-                        elif turn_priority_filter == 'Positive Turns (> 1)':
-                            filtered_turns = filtered_turns[filtered_turns['coaching_priority'] > 1]
-                    
-                    # Display filtered results with row count
-                    st.markdown(f"**Showing {len(filtered_turns)} of {len(turn_df)} turns**")
-                    
-                    if len(filtered_turns) > 0:
-                        st.dataframe(
-                            filtered_turns,
-                            use_container_width=True,
-                            hide_index=True
-                        )
-                    else:
-                        st.info("No turns match the selected filters. Try adjusting your filter criteria.")
+                        avg_turn_sentiment = turn_df['sentiment_compound'].mean()
+                        st.metric("Avg Turn Sentiment", f"{avg_turn_sentiment:.2f}")
+            
+            # Display existing turn analysis if available
+            if st.session_state.turn_analysis is not None:
+                turn_df = st.session_state.turn_analysis
+                
+                # Turn filtering options
+                st.markdown("### Filter Turn Analysis")
+                turn_filter_col1, turn_filter_col2 = st.columns(2)
+                
+                with turn_filter_col1:
+                    # Get unique speakers from actual data
+                    unique_speakers = ['All'] + sorted(turn_df['speaker'].unique().tolist())
+                    speaker_filter = st.selectbox(
+                        "Filter by speaker",
+                        options=unique_speakers,
+                        key="turn_speaker_filter"
+                    )
+                
+                with turn_filter_col2:
+                    turn_priority_filter = st.selectbox(
+                        "Filter by turn priority",
+                        options=['All', 'Critical Turns (< -2)', 'Positive Turns (> 1)'],
+                        key="turn_priority_filter"
+                    )
+                
+                # Apply turn filters
+                filtered_turns = turn_df.copy()
+                
+                # Speaker filter
+                if speaker_filter != 'All':
+                    filtered_turns = filtered_turns[filtered_turns['speaker'] == speaker_filter]
+                
+                # Priority filter  
+                if turn_priority_filter == 'Critical Turns (< -2)':
+                    filtered_turns = filtered_turns[filtered_turns['coaching_priority'] < -2]
+                elif turn_priority_filter == 'Positive Turns (> 1)':
+                    filtered_turns = filtered_turns[filtered_turns['coaching_priority'] > 1]
+                
+                # Display results count
+                st.info(f"Showing {len(filtered_turns)} of {len(turn_df)} turns")
+                
+                # Display filtered turn analysis
+                if len(filtered_turns) > 0:
+                    st.dataframe(
+                        filtered_turns,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.warning("No turns match the selected filters. Please adjust your criteria.")
             
             # Export options
             st.subheader("📤 Export Results")
@@ -977,7 +1018,8 @@ def main():
             - 📊 **NPS Prediction**: Estimates Net Promoter Score based on conversation sentiment
             - 🔄 **Turn-by-Turn Analysis**: Analyzes agent vs customer interactions separately
             - ⚡ **Parallel Processing**: Faster analysis for large datasets
-            - 💾 **Smart Caching**: Optimized performance with session caching
+            - 💾 **Smart Caching**: Optimized performance with session and processing caching
+            - 🗜️ **Parquet Compression**: Efficient data storage with Snappy compression
             - 🎪 **Coaching Priorities**: Weighted scoring system for coaching urgency
             """)
 

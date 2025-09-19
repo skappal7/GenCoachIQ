@@ -531,8 +531,8 @@ def load_file(uploaded_file):
         return None
 
 def main():
-    st.title("📞 Call Center Agent Coaching Analytics")
-    st.markdown("*Transform call transcripts into actionable coaching insights*")
+    st.title("🤖 GenCoachingIQ")
+    st.markdown("*ML and AI Driven Coaching Insights Generator*")
     
     # Sidebar Configuration
     with st.sidebar:

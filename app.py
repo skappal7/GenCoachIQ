@@ -21,8 +21,8 @@ except ImportError:
 
 # Configure page
 st.set_page_config(
-    page_title="GENCoachingIQ",
-    page_icon="🤖",
+    page_title="Call Center Coaching Analytics",
+    page_icon="📞",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -562,8 +562,8 @@ def load_file(uploaded_file):
         return None
 
 def main():
-    st.title("🤖 GENCoachingIQ")
-    st.markdown("*AI and ML Driven Coaching Theme Generator*")
+    st.title("📞 Call Center Agent Coaching Analytics")
+    st.markdown("*Transform call transcripts into actionable coaching insights*")
     
     # Sidebar Configuration
     with st.sidebar:
@@ -669,8 +669,12 @@ def main():
                 st.metric("Critical Issues", high_priority_count)
             
             with col5:
-                total_turns = results_df['total_turns'].sum()
-                st.metric("Total Conversation Turns", total_turns)
+                if 'total_turns' in results_df.columns:
+                    total_turns = results_df['total_turns'].sum()
+                    st.metric("Total Conversation Turns", total_turns)
+                else:
+                    total_transcripts = len(results_df)
+                    st.metric("Total Transcripts", total_transcripts)
             
             # Coaching Priority Analysis
             st.subheader("🎯 Coaching Priority Breakdown")
@@ -709,10 +713,18 @@ def main():
             # Display options
             col1, col2, col3 = st.columns(3)
             with col1:
+                default_cols = ['predicted_nps', 'coaching_priority_score', 'top_coaching_theme']
+                if 'total_turns' in results_df.columns:
+                    default_cols.insert(0, 'total_turns')
+                if 'agent_turns' in results_df.columns:
+                    default_cols.insert(1, 'agent_turns') 
+                if 'customer_turns' in results_df.columns:
+                    default_cols.insert(2, 'customer_turns')
+                
                 show_columns = st.multiselect(
                     "Select columns to display",
                     options=results_df.columns.tolist(),
-                    default=['total_turns', 'agent_turns', 'customer_turns', 'predicted_nps', 'coaching_priority_score', 'top_coaching_theme']
+                    default=default_cols[:5]  # Limit to first 5 defaults
                 )
             
             with col2:
@@ -797,20 +809,32 @@ def main():
                     turn_col1, turn_col2, turn_col3, turn_col4 = st.columns(4)
                     
                     with turn_col1:
-                        agent_turns = len(turn_df[turn_df['speaker'] == 'AGENT'])
-                        st.metric("Agent Turns", agent_turns)
+                        if 'speaker' in turn_df.columns:
+                            agent_turns = len(turn_df[turn_df['speaker'] == 'AGENT'])
+                            st.metric("Agent Turns", agent_turns)
+                        else:
+                            st.metric("Agent Turns", 0)
                     
                     with turn_col2:
-                        customer_turns = len(turn_df[turn_df['speaker'] == 'CUSTOMER'])
-                        st.metric("Customer Turns", customer_turns)
+                        if 'speaker' in turn_df.columns:
+                            customer_turns = len(turn_df[turn_df['speaker'] == 'CUSTOMER'])
+                            st.metric("Customer Turns", customer_turns)
+                        else:
+                            st.metric("Customer Turns", 0)
                     
                     with turn_col3:
-                        critical_turns = len(turn_df[turn_df['coaching_priority'] < -2])
-                        st.metric("Critical Turns", critical_turns)
+                        if 'coaching_priority' in turn_df.columns:
+                            critical_turns = len(turn_df[turn_df['coaching_priority'] < -2])
+                            st.metric("Critical Turns", critical_turns)
+                        else:
+                            st.metric("Critical Turns", 0)
                     
                     with turn_col4:
-                        avg_turn_sentiment = turn_df['sentiment_compound'].mean()
-                        st.metric("Avg Turn Sentiment", f"{avg_turn_sentiment:.2f}")
+                        if 'sentiment_compound' in turn_df.columns:
+                            avg_turn_sentiment = turn_df['sentiment_compound'].mean()
+                            st.metric("Avg Turn Sentiment", f"{avg_turn_sentiment:.2f}")
+                        else:
+                            st.metric("Avg Turn Sentiment", "N/A")
                     
                     # Turn filtering options
                     st.markdown("### Filter Turn Analysis")
@@ -830,13 +854,14 @@ def main():
                     
                     # Apply turn filters
                     filtered_turns = turn_df.copy()
-                    if speaker_filter != 'All':
+                    if speaker_filter != 'All' and 'speaker' in turn_df.columns:
                         filtered_turns = filtered_turns[filtered_turns['speaker'] == speaker_filter]
                     
-                    if turn_priority_filter == 'Critical Turns (< -2)':
-                        filtered_turns = filtered_turns[filtered_turns['coaching_priority'] < -2]
-                    elif turn_priority_filter == 'Positive Turns (> 1)':
-                        filtered_turns = filtered_turns[filtered_turns['coaching_priority'] > 1]
+                    if 'coaching_priority' in turn_df.columns:
+                        if turn_priority_filter == 'Critical Turns (< -2)':
+                            filtered_turns = filtered_turns[filtered_turns['coaching_priority'] < -2]
+                        elif turn_priority_filter == 'Positive Turns (> 1)':
+                            filtered_turns = filtered_turns[filtered_turns['coaching_priority'] > 1]
                     
                     st.dataframe(
                         filtered_turns,

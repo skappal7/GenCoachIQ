@@ -1,20 +1,32 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from io import BytesIO
+from io import BytesIO, StringIO
 import re
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import multiprocessing as mp
 from functools import lru_cache
 import time
-import pickle
 import hashlib
+import os
+import tempfile
+import shutil
+import logging
+from pathlib import Path
+import json
+import gc
 
 # Lightweight NLP libraries
-from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+try:
+    from flashtext import KeywordProcessor
+    FLASHTEXT_AVAILABLE = True
+except ImportError:
+    FLASHTEXT_AVAILABLE = False
+    st.warning("FlashText not installed. Using regex fallback (slower)")
 
-# PyArrow compute functions for vectorized operations
+# PyArrow for efficient data handling
 try:
     import pyarrow.parquet as pq
     import pyarrow as pa
@@ -24,1433 +36,1000 @@ except ImportError:
     st.error("Please install pyarrow: pip install pyarrow")
     st.stop()
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Configure page
 st.set_page_config(
-    page_title="Call Center Coaching Analytics",
+    page_title="Call Center Coaching Analytics - Production",
     page_icon="📞",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+# Production constants
+BATCH_SIZE = 5000  # Process in 5k row chunks
+MAX_WORKERS = min(4, mp.cpu_count() - 1)  # Leave one CPU for Streamlit
+CHUNK_SIZE_MB = 50  # Read CSV in 50MB chunks
+MAX_MEMORY_MB = 1000  # Max memory before forcing garbage collection
+PARQUET_ROW_GROUP_SIZE = 10000  # Optimal for query performance
+ZSTD_COMPRESSION_LEVEL = 3  # Fast compression, good ratio
+TEMP_DIR = tempfile.gettempdir()
+RESULTS_DIR = Path(TEMP_DIR) / "call_center_results"
+SAFETY_TIMEOUT = 300  # 5 minute timeout per batch
+
 def initialize_session_state():
-    """Initialize session state with comprehensive caching capabilities"""
-    if 'processed_data' not in st.session_state:
-        st.session_state.processed_data = None
-    if 'turn_analysis' not in st.session_state:
-        st.session_state.turn_analysis = None
-    if 'file_uploaded' not in st.session_state:
-        st.session_state.file_uploaded = False
+    """Initialize session state for production use"""
+    if 'processing_status' not in st.session_state:
+        st.session_state.processing_status = "idle"
+    if 'batch_progress' not in st.session_state:
+        st.session_state.batch_progress = 0
+    if 'total_batches' not in st.session_state:
+        st.session_state.total_batches = 0
+    if 'results_path' not in st.session_state:
+        st.session_state.results_path = None
+    if 'processing_metrics' not in st.session_state:
+        st.session_state.processing_metrics = {}
     if 'file_hash' not in st.session_state:
         st.session_state.file_hash = None
-    if 'processing_cache' not in st.session_state:
-        st.session_state.processing_cache = {}
-    if 'parquet_table' not in st.session_state:
-        st.session_state.parquet_table = None
-    if 'compression_stats' not in st.session_state:
-        st.session_state.compression_stats = {}
-    if 'arrow_cache' not in st.session_state:
-        st.session_state.arrow_cache = {}
-    if 'last_file' not in st.session_state:
-        st.session_state.last_file = None
 
-class ArrowVectorizedEngine:
-    """Pure PyArrow vectorized compute engine for maximum performance"""
-    
-    @staticmethod
-    def convert_to_optimized_parquet(df, filename):
-        """Convert DataFrame to highly optimized Arrow Parquet format"""
-        try:
-            with st.spinner(f"Converting {filename} to Arrow-optimized Parquet format..."):
-                # Calculate original memory usage
-                original_size_bytes = df.memory_usage(deep=True).sum()
-                original_size_mb = original_size_bytes / 1024 / 1024
-                
-                # Convert to PyArrow Table with optimized schema
-                table = pa.Table.from_pandas(df)
-                
-                # Apply dictionary encoding for string columns
-                optimized_fields = []
-                for field in table.schema:
-                    if pa.types.is_string(field.type):
-                        # Use dictionary encoding for efficient string storage
-                        optimized_fields.append(
-                            pa.field(field.name, pa.dictionary(pa.int32(), pa.string()))
-                        )
-                    else:
-                        optimized_fields.append(field)
-                
-                # Cast to optimized schema
-                optimized_schema = pa.schema(optimized_fields)
-                optimized_table = table.cast(optimized_schema)
-                
-                # Write to Parquet with maximum optimizations
-                parquet_buffer = BytesIO()
-                pq.write_table(
-                    optimized_table,
-                    parquet_buffer,
-                    compression='zstd',
-                    compression_level=6, 
-                    use_dictionary=False,
-                    row_group_size=20000,
-                    use_compliant_nested_type=True,
-                    write_statistics=True,
-                    use_byte_stream_split=False,
-                    
-                )
-                parquet_buffer.seek(0)
-                
-                # Read back compressed table
-                compressed_table = pq.read_table(parquet_buffer)
-                
-                # Calculate compression statistics
-                compressed_size_bytes = len(parquet_buffer.getvalue())
-                compressed_size_mb = compressed_size_bytes / 1024 / 1024
-                compression_ratio = (
-                    (original_size_bytes - compressed_size_bytes) / original_size_bytes * 100
-                ) if original_size_bytes > 0 else 0
-                
-                compression_stats = {
-                    'original_size_mb': original_size_mb,
-                    'compressed_size_mb': compressed_size_mb,
-                    'compression_ratio': compression_ratio,
-                    'memory_savings': original_size_mb - compressed_size_mb,
-                    'arrow_optimized': True,
-                    'row_groups': compressed_table.num_rows // 50000 + 1
-                }
-                
-                # Display compression results
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Original Size", f"{original_size_mb:.2f} MB")
-                with col2:
-                    st.metric("Compressed Size", f"{compressed_size_mb:.2f} MB")
-                with col3:
-                    st.metric("Compression Ratio", f"{compression_ratio:.1f}%")
-                with col4:
-                    st.metric("Memory Saved", f"{compression_stats['memory_savings']:.2f} MB")
-                
-                st.success("✅ Arrow-optimized Parquet conversion completed with maximum compression")
-                
-                # Store only Arrow table in session state
-                st.session_state.parquet_table = compressed_table
-                st.session_state.compression_stats = compression_stats
-                
-                return compressed_table, compression_stats
-                
-        except Exception as e:
-            st.error(f"Arrow Parquet optimization failed: {str(e)}")
-            # Fallback to basic Arrow table
-            try:
-                table = pa.Table.from_pandas(df)
-                st.warning("Using basic Arrow table without optimizations")
-                return table, {}
-            except Exception as fallback_error:
-                st.error(f"Complete conversion failed: {str(fallback_error)}")
-                return None, {}
-    
-    @staticmethod
-    def vectorized_regex_matching(arrow_column, patterns):
-        """Ultra-fast vectorized regex pattern matching using Arrow compute"""
-        try:
-            # Combine all patterns into single regex for maximum efficiency
-            combined_pattern = "|".join([re.escape(pattern.lower()) for pattern in patterns])
-            
-            # Convert to lowercase using Arrow string functions
-            lowercase_column = pc.utf8_lower(arrow_column)
-            
-            # Apply vectorized regex matching
-            matches = pc.match_substring_regex(lowercase_column, combined_pattern)
-            
-            return matches
-            
-        except Exception as e:
-            st.warning(f"Vectorized regex failed: {e}. Using fallback method.")
-            # Fallback with individual pattern matching
-            combined_matches = pa.array([False] * len(arrow_column))
-            
-            for pattern in patterns:
-                try:
-                    pattern_matches = pc.match_substring(
-                        pc.utf8_lower(arrow_column), 
-                        pattern.lower()
-                    )
-                    combined_matches = pc.or_(combined_matches, pattern_matches)
-                except Exception:
-                    continue
-                    
-            return combined_matches
-    
-    @staticmethod
-    def bulk_theme_analysis(arrow_column, coaching_themes):
-        """Vectorized analysis of all coaching themes simultaneously"""
-        theme_analysis_results = {}
-        
-        try:
-            for theme_name, theme_patterns in coaching_themes.items():
-                # Vectorized pattern matching for current theme
-                theme_matches = ArrowVectorizedEngine.vectorized_regex_matching(
-                    arrow_column, theme_patterns
-                )
-                
-                # Count total matches using Arrow aggregation
-                total_matches = pc.sum(pc.cast(theme_matches, pa.int64())).as_py()
-                
-                # Store vectorized results
-                theme_analysis_results[theme_name] = {
-                    'matches_array': theme_matches,
-                    'total_count': total_matches,
-                    'sample_phrases': theme_patterns[:5]
-                }
-                
-        except Exception as e:
-            st.error(f"Bulk theme analysis failed: {e}")
-            # Return empty results as fallback
-            for theme_name in coaching_themes.keys():
-                theme_analysis_results[theme_name] = {
-                    'matches_array': pa.array([False] * len(arrow_column)),
-                    'total_count': 0,
-                    'sample_phrases': []
-                }
-        
-        return theme_analysis_results
-    
-    @staticmethod
-    def vectorized_sentiment_pipeline(arrow_column, vader_analyzer):
-        """High-performance vectorized sentiment analysis pipeline"""
-        try:
-            # Convert to Python list (required for external NLP libraries)
-            text_list = arrow_column.to_pylist()
-            
-            # Vectorized processing with list comprehensions for speed
-            vader_results = []
-            textblob_scores = []
-            
-            # Batch process sentiment analysis
-            for text in text_list:
-                try:
-                    if text and not pd.isna(text) and str(text).strip():
-                        # VADER analysis
-                        vader_score = vader_analyzer.polarity_scores(str(text))
-                        vader_results.append(vader_score)
-                        
-                        # TextBlob analysis
-                        blob_score = TextBlob(str(text)).sentiment.polarity
-                        textblob_scores.append(blob_score)
-                    else:
-                        # Handle null/empty values
-                        vader_results.append({
-                            'compound': 0.0, 'pos': 0.0, 'neg': 0.0, 'neu': 0.0
-                        })
-                        textblob_scores.append(0.0)
-                        
-                except Exception:
-                    # Error handling for individual texts
-                    vader_results.append({
-                        'compound': 0.0, 'pos': 0.0, 'neg': 0.0, 'neu': 0.0
-                    })
-                    textblob_scores.append(0.0)
-            
-            # Convert results back to Arrow arrays for vectorized operations
-            return {
-                'vader_compound': pa.array([r['compound'] for r in vader_results]),
-                'vader_positive': pa.array([r['pos'] for r in vader_results]),
-                'vader_negative': pa.array([r['neg'] for r in vader_results]),
-                'vader_neutral': pa.array([r['neu'] for r in vader_results]),
-                'textblob_polarity': pa.array(textblob_scores)
-            }
-            
-        except Exception as e:
-            st.error(f"Vectorized sentiment analysis failed: {e}")
-            # Return zero arrays as fallback
-            array_length = len(arrow_column)
-            zero_array = pa.array([0.0] * array_length)
-            
-            return {
-                'vader_compound': zero_array,
-                'vader_positive': zero_array,
-                'vader_negative': zero_array,
-                'vader_neutral': zero_array,
-                'textblob_polarity': zero_array
-            }
-    
-    @staticmethod
-    def vectorized_nps_calculation(sentiment_compound_array):
-        """Lightning-fast vectorized NPS prediction using Arrow operations"""
-        try:
-            # Ensure we have an Arrow array
-            if not isinstance(sentiment_compound_array, pa.Array):
-                sentiment_compound_array = pa.array(sentiment_compound_array)
-            
-            # Vectorized NPS scoring based on sentiment ranges
-            nps_scores = []
-            sentiment_values = sentiment_compound_array.to_pylist()
-            
-            # Optimized batch NPS calculation
-            for sentiment in sentiment_values:
-                if sentiment >= 0.5:
-                    nps_scores.append(np.random.randint(9, 11))  # Promoters (9-10)
-                elif sentiment >= 0.1:
-                    nps_scores.append(np.random.randint(7, 9))   # Passives (7-8)
-                else:
-                    nps_scores.append(np.random.randint(0, 7))   # Detractors (0-6)
-            
-            return pa.array(nps_scores)
-            
-        except Exception as e:
-            st.warning(f"Vectorized NPS calculation failed: {e}")
-            # Fallback with random scores
-            array_length = len(sentiment_compound_array) if hasattr(sentiment_compound_array, '__len__') else 100
-            return pa.array(np.random.randint(0, 11, array_length))
-    
-    @staticmethod
-    def vectorized_timestamp_parsing(arrow_column):
-        """High-speed vectorized parsing of embedded timestamps and speakers"""
-        try:
-            # Regex pattern for embedded format [HH:MM:SS SPEAKER]: dialogue
-            timestamp_regex = r'\[(\d{1,2}:\d{2}:\d{2})\s+([A-Za-z]+)\]:\s*(.*?)(?=\[\d{1,2}:\d{2}:\d{2}|$)'
-            
-            parsing_results = []
-            text_list = arrow_column.to_pylist()
-            
-            # Vectorized regex processing
-            for text in text_list:
-                if not text:
-                    parsing_results.append({
-                        'total_turns': 0,
-                        'agent_turns': 0,
-                        'customer_turns': 0,
-                        'avg_turn_length': 0
-                    })
-                    continue
-                
-                try:
-                    # Extract all timestamp-speaker-dialogue matches
-                    matches = re.findall(timestamp_regex, str(text), re.DOTALL | re.IGNORECASE)
-                    
-                    # Count different speaker types
-                    agent_speakers = ['AGENT', 'REP', 'REPRESENTATIVE', 'ADVISOR']
-                    customer_speakers = ['CUSTOMER', 'CLIENT', 'CALLER', 'USER']
-                    
-                    agent_count = sum(
-                        1 for match in matches 
-                        if match[1].upper() in agent_speakers
-                    )
-                    customer_count = sum(
-                        1 for match in matches 
-                        if match[1].upper() in customer_speakers
-                    )
-                    
-                    # Calculate average turn length
-                    turn_lengths = [len(match[2]) for match in matches if match[2]]
-                    avg_length = sum(turn_lengths) / len(turn_lengths) if turn_lengths else 0
-                    
-                    parsing_results.append({
-                        'total_turns': len(matches),
-                        'agent_turns': agent_count,
-                        'customer_turns': customer_count,
-                        'avg_turn_length': round(avg_length, 1)
-                    })
-                    
-                except Exception:
-                    # Error handling for individual texts
-                    parsing_results.append({
-                        'total_turns': 0,
-                        'agent_turns': 0,
-                        'customer_turns': 0,
-                        'avg_turn_length': 0
-                    })
-            
-            return parsing_results
-            
-        except Exception as e:
-            st.warning(f"Vectorized timestamp parsing failed: {e}")
-            # Return zero results as fallback
-            array_length = len(arrow_column)
-            return [{
-                'total_turns': 0,
-                'agent_turns': 0,
-                'customer_turns': 0,
-                'avg_turn_length': 0
-            }] * array_length
-    
-    @staticmethod
-    def vectorized_priority_scoring(theme_results, weight_mapping):
-        """Ultra-fast vectorized coaching priority calculation using Arrow compute"""
-        try:
-            # Get array length from first theme
-            array_length = len(next(iter(theme_results.values()))['matches_array'])
-            
-            # Initialize priority scores array
-            priority_scores = [0.0] * array_length
-            
-            # Vectorized priority calculation
-            for theme_name, theme_data in theme_results.items():
-                if theme_name in weight_mapping:
-                    weight = weight_mapping[theme_name]
-                    matches_list = theme_data['matches_array'].to_pylist()
-                    
-                    # Apply weights vectorized
-                    for idx, has_match in enumerate(matches_list):
-                        if has_match:
-                            priority_scores[idx] += weight
-            
-            return pa.array(priority_scores)
-            
-        except Exception as e:
-            st.warning(f"Vectorized priority scoring failed: {e}")
-            # Return zero array as fallback
-            array_length = len(next(iter(theme_results.values()))['matches_array']) if theme_results else 100
-            return pa.array([0.0] * array_length)
-
-class CallCenterVectorizedAnalyzer:
-    """Advanced call center analyzer with pure vectorized operations"""
+class ProductionCoachingThemes:
+    """Optimized coaching themes using FlashText for performance"""
     
     def __init__(self):
-        self.vader_analyzer = SentimentIntensityAnalyzer()
-        self.vectorized_engine = ArrowVectorizedEngine()
-        
-        # Comprehensive coaching themes for vectorized analysis
-        self.coaching_themes = {
+        self.themes = {
             "empathy": [
-                "I understand", "I completely understand", "I do understand", "I hear you",
-                "I see how you feel", "I see where you're coming from", "I realize this is frustrating",
-                "I can imagine", "I know this must be tough", "I'm sorry", "I apologize",
-                "I truly empathize", "thank you for your patience", "thank you for waiting",
-                "your concern is valid", "I totally get it", "I know how you feel",
-                "sorry to hear that", "I get your frustration", "I appreciate you sharing this",
-                "must be difficult", "I respect your concern", "I'm here to help",
-                "I hear the frustration in your voice", "I can sense this has been upsetting",
-                "it sounds like this caused you trouble", "I'll do everything I can"
+                "I understand", "I completely understand", "I hear you",
+                "I see how you feel", "I realize this is frustrating",
+                "I'm sorry", "I apologize", "thank you for your patience"
             ],
             "professionalism": [
-                "thank you for calling", "good morning", "good afternoon", "good evening",
-                "it's my pleasure", "I'll be happy to help", "thank you for reaching out",
-                "thank you for your time", "I appreciate your time", "it's been a pleasure",
-                "with respect", "I assure you", "I value your feedback", "thank you for choosing us",
-                "allow me to assist", "thanks for your cooperation", "thanks for staying on the line",
-                "I appreciate your understanding", "thank you for bearing with me",
-                "I appreciate your patience"
+                "thank you for calling", "good morning", "good afternoon",
+                "it's my pleasure", "I'll be happy to help"
             ],
             "problem_solving": [
-                "let me check this for you", "let me look into this", "I will fix this",
-                "I'll work on resolving this", "we'll sort this out", "let's troubleshoot together",
-                "let me walk you through", "next steps will be", "I'll escalate this for resolution",
-                "I'll provide a workaround", "we can try this option", "here's a solution",
-                "I will investigate further", "I will resolve this", "I'll take corrective action",
-                "let's address this issue", "let me confirm once more", "this should fix it",
-                "the root cause appears to be", "we'll ensure this won't happen again",
-                "rest assured", "let me double-check that", "I'll send this to our specialist",
-                "I'll fast-track this to our tech team"
+                "let me check", "let me look into", "I will fix",
+                "we'll sort this out", "let's troubleshoot", "here's a solution"
             ],
             "escalation_triggers": [
-                "I want to speak to your supervisor", "let me talk to your manager",
-                "this is unacceptable", "this is ridiculous", "you people are useless",
-                "I've called 5 times already", "I'm sick of this", "you guys messed up",
-                "I don't want excuses", "just fix it", "cancel my account", "I'm done with your service",
-                "I'll take my business elsewhere", "I'll post a bad review", "I'm wasting my time",
-                "you never listen", "nobody helps me here", "why is this so difficult",
-                "I don't believe you", "you're not helping me"
+                "speak to supervisor", "talk to manager", "this is unacceptable",
+                "cancel my account", "take my business elsewhere"
             ],
             "listening": [
-                "let me repeat that back", "so what you're saying is", "to confirm your point",
-                "just to clarify", "if I understand correctly", "I heard you say",
-                "I got that", "I see what you mean", "noted", "please continue",
-                "go ahead", "tell me more about that", "let me make sure I understood",
-                "correct me if I'm wrong", "I'm listening carefully", "thanks for sharing that",
-                "so to summarize your concern", "let me restate it to be sure",
-                "to check my understanding", "just to make sure I captured that correctly"
-            ],
-            "polite_agent": [
-                "please", "may I ask", "could you kindly", "if you don't mind",
-                "thank you very much", "I'd be glad to assist", "allow me a moment",
-                "thanks for waiting", "thank you for clarifying", "please hold while I check",
-                "thanks for your cooperation", "thanks for your patience",
-                "may I confirm", "if that's okay with you", "let me check that for you"
-            ],
-            "impolite_agent": [
-                "that's not my problem", "I can't help you with that", "that's impossible",
-                "you'll have to deal with it", "I already told you", "you're not listening",
-                "that's just the way it is", "there's nothing I can do", "stop interrupting me",
-                "you should have read the policy", "you must have done it wrong",
-                "we can't do anything about that", "I don't have time for this",
-                "that's not my department", "you need to figure it out"
-            ],
-            "closing": [
-                "is there anything else I can help you with", "thank you for your time today",
-                "thank you for calling", "I appreciate your patience",
-                "your issue has been resolved", "let me summarize",
-                "to recap", "to confirm the resolution", "please reach out again if needed",
-                "I'm glad I could help", "thank you once again", "we appreciate your business",
-                "it's been my pleasure assisting you", "enjoy your day", "take care",
-                "closing the loop", "all set now", "your concern is addressed",
-                "we look forward to serving you again"
-            ],
-            "urgency": [
-                "I'll prioritize this", "this will be resolved urgently", "I'll escalate immediately",
-                "we'll handle this right away", "this is high priority", "critical matter",
-                "this needs immediate attention", "I'll fast-track this", "we'll expedite the process",
-                "as soon as possible", "I'll make this a top priority", "we'll resolve this quickly",
-                "urgent escalation required", "emergency handling", "let's address this without delay"
-            ],
-            "customer_colloquialisms": [
-                "you guys messed up", "why is this so hard", "you never help me",
-                "every time I call", "same old story", "I'm fed up", "this always happens",
-                "I'm not happy with this", "don't waste my time", "you people always say that",
-                "I already explained this", "why can't you fix it", "this is taking forever",
-                "it's not rocket science", "how hard can it be", "I'm losing my patience",
-                "you're just reading a script", "talking to a wall"
-            ],
-            "domain_specific": [
-                "account balance", "policy number", "premium due", "loan repayment", "mortgage",
-                "installment", "interest rate", "credit card limit", "insurance claim", "underwriting",
-                "KYC process", "coverage details", "deductible", "co-pay", "payout", "settlement",
-                "investment maturity", "fixed deposit", "account closure", "order ID", "shipment tracking",
-                "refund request", "return policy", "replacement order", "discount coupon", "promo code",
-                "delivery date", "out of stock", "loyalty points", "cart checkout", "payment failure",
-                "invoice copy", "exchange request", "doctor appointment", "prescription refill",
-                "medical records", "insurance coverage", "treatment plan", "consultation", "diagnosis",
-                "lab results", "pharmacy", "claim rejection", "prior authorization", "health benefits",
-                "flight booking", "ticket cancellation", "check-in", "boarding pass", "reservation number",
-                "baggage allowance", "seat upgrade", "travel insurance", "itinerary", "visa application",
-                "hotel reservation", "passport details", "flight delay", "lost baggage"
-            ],
-            "customer_satisfaction": [
-                "thank you so much", "you've been very helpful", "I appreciate your help",
-                "that was exactly what I needed", "perfect", "excellent service", "great job",
-                "you solved my problem", "I'm satisfied", "that's much better", "wonderful",
-                "you're amazing", "I'm impressed", "outstanding support", "quick resolution",
-                "you made this easy", "fantastic", "couldn't ask for better service"
-            ],
-            "customer_dissatisfaction": [
-                "this is terrible", "worst service ever", "I'm not satisfied", "this doesn't help",
-                "you're wasting my time", "I'm still confused", "this makes no sense",
-                "you didn't fix anything", "I'm more frustrated now", "this is getting worse",
-                "I regret calling", "you made it worse", "I'm disappointed", "useless advice",
-                "I want my money back", "I'm canceling everything", "I'll never use this service again"
-            ],
-            "knowledge_gaps": [
-                "I don't know", "I'm not sure", "let me find out", "I'll have to check",
-                "that's not my area", "I'm not familiar with that", "I'll need to ask someone",
-                "I don't have that information", "I'll get back to you", "let me research that",
-                "I'm not trained on that", "I'll transfer you", "that's above my level",
-                "I don't have access to that", "I'm still learning about that"
-            ],
-            "customer_effort": [
-                "I've been transferred 3 times", "I've been on hold forever", "I keep repeating myself",
-                "I already told the other person", "why do I have to explain again", "this is my fifth call",
-                "I've been calling all day", "no one can help me", "I keep getting bounced around",
-                "I've tried everything", "this is taking too long", "I've wasted hours on this",
-                "why is this so complicated", "I shouldn't have to do this much work"
+                "let me repeat", "so what you're saying", "to confirm",
+                "if I understand correctly", "tell me more"
             ]
         }
         
-        # Weighted scoring system for coaching priorities
-        self.theme_weights = {
-            "impolite_agent": -3,      # Critical negative
-            "knowledge_gaps": -2,      # Major coaching need
-            "escalation_triggers": -2, # Major concern
-            "customer_dissatisfaction": -1,
-            "customer_effort": -1,
-            "empathy": 2,              # Major positive
-            "problem_solving": 2,      # Major positive
-            "professionalism": 1,
-            "listening": 1,
-            "polite_agent": 1,
-            "customer_satisfaction": 1,
-            "closing": 1,
-            "urgency": 0.5,
-            "customer_colloquialisms": 0,
-            "domain_specific": 0
-        }
+        # Initialize FlashText processors if available
+        self.keyword_processors = {}
+        if FLASHTEXT_AVAILABLE:
+            for theme_name, keywords in self.themes.items():
+                processor = KeywordProcessor(case_sensitive=False)
+                for keyword in keywords:
+                    processor.add_keyword(keyword, theme_name)
+                self.keyword_processors[theme_name] = processor
     
-    def process_parquet_table_vectorized(self, parquet_table, text_column_name):
-        """Master function: Complete vectorized processing of Arrow Parquet table"""
-        st.info("🚀 Initiating pure vectorized Arrow compute operations")
+    def extract_themes_flashtext(self, text):
+        """Ultra-fast theme extraction using FlashText"""
+        if not FLASHTEXT_AVAILABLE:
+            return self.extract_themes_regex(text)
         
-        # Generate sophisticated cache key
-        table_signature = f"{parquet_table.num_rows}_{hash(str(parquet_table.schema))}_{text_column_name}"
-        cache_key = hashlib.md5(f"vectorized_{table_signature}".encode()).hexdigest()
+        themes_found = set()
+        for theme_name, processor in self.keyword_processors.items():
+            if processor.extract_keywords(text):
+                themes_found.add(theme_name)
+        return list(themes_found)
+    
+    def extract_themes_regex(self, text):
+        """Fallback regex extraction"""
+        themes_found = []
+        text_lower = text.lower() if text else ""
         
-        # Check Arrow cache for existing results
-        if cache_key in st.session_state.arrow_cache:
-            st.info("📋 Retrieving cached vectorized Arrow results")
-            return st.session_state.arrow_cache[cache_key]
+        for theme_name, keywords in self.themes.items():
+            for keyword in keywords:
+                if keyword.lower() in text_lower:
+                    themes_found.append(theme_name)
+                    break
+        return themes_found
+
+class StreamingProcessor:
+    """Handles streaming processing of large files"""
+    
+    def __init__(self, temp_dir=RESULTS_DIR):
+        self.temp_dir = Path(temp_dir)
+        self.temp_dir.mkdir(exist_ok=True)
+        self.vader = SentimentIntensityAnalyzer()
+        self.theme_extractor = ProductionCoachingThemes()
         
+    def safe_cast_to_string(self, table):
+        """Safely cast dictionary encoded columns to string"""
+        new_fields = []
+        for i, field in enumerate(table.schema):
+            column = table.column(i)
+            if pa.types.is_dictionary(field.type):
+                # Cast dictionary to string
+                new_column = pc.cast(column, pa.string())
+                table = table.set_column(i, field.name, new_column)
+        return table
+    
+    def process_batch(self, batch_df, batch_id, text_column):
+        """Process a single batch with all safety measures"""
         try:
-            # Extract text column as Arrow array (pure Arrow operation)
-            text_column = parquet_table.column(text_column_name)
-            st.info(f"Processing {len(text_column)} records using vectorized operations")
+            start_time = time.time()
+            logger.info(f"Processing batch {batch_id} with {len(batch_df)} rows")
             
-            # Stage 1: Vectorized sentiment analysis
-            with st.spinner("Stage 1: Executing vectorized sentiment analysis pipeline..."):
-                sentiment_results = self.vectorized_engine.vectorized_sentiment_pipeline(
-                    text_column, self.vader_analyzer
-                )
+            results = []
             
-            # Stage 2: Bulk coaching theme analysis
-            with st.spinner("Stage 2: Performing bulk coaching theme analysis..."):
-                theme_analysis = self.vectorized_engine.bulk_theme_analysis(
-                    text_column, self.coaching_themes
-                )
-            
-            # Stage 3: Vectorized priority scoring
-            with st.spinner("Stage 3: Computing vectorized coaching priorities..."):
-                priority_scores = self.vectorized_engine.vectorized_priority_scoring(
-                    theme_analysis, self.theme_weights
-                )
-            
-            # Stage 4: Vectorized NPS prediction
-            with st.spinner("Stage 4: Generating vectorized NPS predictions..."):
-                nps_predictions = self.vectorized_engine.vectorized_nps_calculation(
-                    sentiment_results['vader_compound']
-                )
-            
-            # Stage 5: Vectorized timestamp parsing
-            with st.spinner("Stage 5: Executing vectorized timestamp parsing..."):
-                timestamp_analysis = self.vectorized_engine.vectorized_timestamp_parsing(
-                    text_column
-                )
-            
-            # Stage 6: Determine top themes per record (vectorized)
-            with st.spinner("Stage 6: Computing top coaching themes..."):
-                top_themes = []
-                theme_counts = []
+            for idx, row in batch_df.iterrows():
+                text = str(row[text_column]) if pd.notna(row[text_column]) else ""
                 
-                for record_idx in range(len(text_column)):
-                    record_themes = {}
-                    for theme_name, theme_data in theme_analysis.items():
-                        if theme_data['matches_array'][record_idx].as_py():
-                            record_themes[theme_name] = self.theme_weights.get(theme_name, 0)
-                    
-                    # Select theme with highest absolute weight
-                    if record_themes:
-                        top_theme = max(record_themes.keys(), key=lambda x: abs(record_themes[x]))
-                    else:
-                        top_theme = 'none'
-                    
-                    top_themes.append(top_theme)
-                    theme_counts.append(len(record_themes))
-            
-            # Stage 7: Text truncation using Arrow string operations
-            try:
-                truncated_texts = pc.utf8_slice_codeunits(text_column, 0, 200)
-                display_texts = [
-                    text + '...' if len(text) > 200 else text 
-                    for text in truncated_texts.to_pylist()
-                ]
-            except:
-                # Fallback truncation
-                display_texts = [
-                    text[:200] + '...' if len(str(text)) > 200 else str(text)
-                    for text in text_column.to_pylist()
-                ]
-            
-            # Stage 8: Construct final Arrow table with all results
-            vectorized_results = {
-                'transcript_text': pa.array(display_texts),
-                'total_turns': pa.array([ts['total_turns'] for ts in timestamp_analysis]),
-                'agent_turns': pa.array([ts['agent_turns'] for ts in timestamp_analysis]),
-                'customer_turns': pa.array([ts['customer_turns'] for ts in timestamp_analysis]),
-                'avg_turn_length': pa.array([ts['avg_turn_length'] for ts in timestamp_analysis]),
-                'vader_compound': sentiment_results['vader_compound'],
-                'vader_positive': sentiment_results['vader_positive'],
-                'vader_negative': sentiment_results['vader_negative'],
-                'vader_neutral': sentiment_results['vader_neutral'],
-                'textblob_polarity': sentiment_results['textblob_polarity'],
-                'predicted_nps': nps_predictions,
-                'coaching_priority_score': priority_scores,
-                'top_coaching_theme': pa.array(top_themes),
-                'theme_count': pa.array(theme_counts),
-                'processing_method': pa.array(['vectorized_arrow'] * len(text_column))
-            }
-            
-            # Convert to DataFrame for Streamlit display (final step only)
-            result_dataframe = pa.table(vectorized_results).to_pandas()
-            
-            # Apply precision rounding for numeric columns
-            numeric_precision_columns = [
-                'vader_compound', 'vader_positive', 'vader_negative', 
-                'vader_neutral', 'textblob_polarity', 'coaching_priority_score'
-            ]
-            for col in numeric_precision_columns:
-                if col in result_dataframe.columns:
-                    result_dataframe[col] = result_dataframe[col].round(3)
-            
-            # Cache the vectorized results
-            st.session_state.arrow_cache[cache_key] = result_dataframe
-            
-            st.success(f"✅ Vectorized processing completed: {len(result_dataframe)} records analyzed")
-            return result_dataframe
-            
-        except Exception as e:
-            st.error(f"Vectorized Arrow processing encountered error: {str(e)}")
-            st.info("Please check your data format and try again")
-            return None
-    
-    def generate_vectorized_turn_analysis(self, parquet_table, text_column_name):
-        """Advanced vectorized turn-by-turn analysis using Arrow operations"""
-        st.info("🔄 Executing vectorized turn-by-turn analysis")
-        
-        try:
-            # Extract text column for turn analysis
-            text_column = parquet_table.column(text_column_name)
-            
-            turn_analysis_results = []
-            progress_tracker = st.progress(0)
-            
-            # Regex pattern for embedded timestamp format
-            turn_extraction_pattern = r'\[(\d{1,2}:\d{2}:\d{2})\s+([A-Za-z]+)\]:\s*(.*?)(?=\[\d{1,2}:\d{2}:\d{2}|$)'
-            
-            # Process each transcript for turn extraction
-            for transcript_idx, transcript_text in enumerate(text_column.to_pylist()):
-                if not transcript_text:
+                # Skip empty texts
+                if not text.strip():
                     continue
                 
-                try:
-                    # Extract individual turns using regex
-                    turn_matches = re.findall(
-                        turn_extraction_pattern, 
-                        str(transcript_text), 
-                        re.DOTALL | re.IGNORECASE
+                # Sentiment analysis
+                sentiment_scores = self.vader.polarity_scores(text)
+                
+                # Theme extraction
+                themes = self.theme_extractor.extract_themes_flashtext(text)
+                
+                # Calculate coaching priority
+                priority = self._calculate_priority(sentiment_scores, themes)
+                
+                # Predict NPS
+                nps = self._predict_nps(sentiment_scores['compound'])
+                
+                results.append({
+                    'batch_id': batch_id,
+                    'row_index': idx,
+                    'text_preview': text[:200] + '...' if len(text) > 200 else text,
+                    'sentiment_compound': round(sentiment_scores['compound'], 3),
+                    'sentiment_positive': round(sentiment_scores['pos'], 3),
+                    'sentiment_negative': round(sentiment_scores['neg'], 3),
+                    'themes': ','.join(themes) if themes else 'none',
+                    'theme_count': len(themes),
+                    'coaching_priority': round(priority, 2),
+                    'predicted_nps': nps,
+                    'processing_time': round(time.time() - start_time, 2)
+                })
+            
+            # Convert to Arrow table for efficient storage
+            if results:
+                results_df = pd.DataFrame(results)
+                table = pa.Table.from_pandas(results_df)
+                
+                # Safe casting
+                table = self.safe_cast_to_string(table)
+                
+                # Write to partitioned parquet
+                partition_path = self.temp_dir / f"batch_{batch_id:04d}.parquet"
+                pq.write_table(
+                    table,
+                    partition_path,
+                    compression='zstd',
+                    compression_level=ZSTD_COMPRESSION_LEVEL,
+                    use_dictionary=False,  # Critical: no dictionary for text
+                    data_page_size=2097152,  # 2MB pages
+                    row_group_size=PARQUET_ROW_GROUP_SIZE
+                )
+                
+                logger.info(f"Batch {batch_id} completed in {time.time() - start_time:.2f}s")
+                return True, len(results), partition_path
+            
+            return True, 0, None
+            
+        except Exception as e:
+            logger.error(f"Batch {batch_id} failed: {str(e)}")
+            return False, 0, None
+    
+    def _calculate_priority(self, sentiment, themes):
+        """Calculate coaching priority score"""
+        priority = sentiment['compound'] * 2
+        
+        # Adjust based on themes
+        if 'escalation_triggers' in themes:
+            priority -= 2
+        if 'empathy' in themes:
+            priority += 1
+        if 'problem_solving' in themes:
+            priority += 1
+            
+        return priority
+    
+    def _predict_nps(self, compound_sentiment):
+        """Predict NPS based on sentiment"""
+        if compound_sentiment >= 0.5:
+            return np.random.randint(9, 11)
+        elif compound_sentiment >= 0.1:
+            return np.random.randint(7, 9)
+        else:
+            return np.random.randint(0, 7)
+
+def process_file_streaming(uploaded_file, text_column):
+    """Main streaming processing function"""
+    processor = StreamingProcessor()
+    
+    # Clear previous results
+    if processor.temp_dir.exists():
+        shutil.rmtree(processor.temp_dir)
+    processor.temp_dir.mkdir(exist_ok=True)
+    
+    # Calculate file hash for caching
+    file_hash = hashlib.md5(uploaded_file.getvalue()).hexdigest()
+    
+    # Check if already processed
+    if st.session_state.file_hash == file_hash and st.session_state.results_path:
+        st.info("Using cached results")
+        return st.session_state.results_path
+    
+    st.session_state.file_hash = file_hash
+    
+    # Determine file type
+    file_extension = uploaded_file.name.split('.')[-1].lower()
+    
+    total_rows = 0
+    batch_id = 0
+    successful_batches = []
+    failed_batches = []
+    
+    # Create progress indicators
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    metrics_container = st.container()
+    
+    start_time = time.time()
+    
+    try:
+        if file_extension == 'csv':
+            # Stream CSV in chunks
+            chunk_iterator = pd.read_csv(
+                uploaded_file,
+                chunksize=BATCH_SIZE,
+                low_memory=False,
+                on_bad_lines='skip'
+            )
+            
+            # Count total chunks (approximate)
+            uploaded_file.seek(0)
+            total_lines = sum(1 for _ in uploaded_file) - 1  # Subtract header
+            uploaded_file.seek(0)
+            estimated_batches = (total_lines // BATCH_SIZE) + 1
+            st.session_state.total_batches = estimated_batches
+            
+            # Process chunks with worker pool
+            with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {}
+                
+                for chunk_df in chunk_iterator:
+                    if text_column not in chunk_df.columns:
+                        st.error(f"Column '{text_column}' not found in file")
+                        return None
+                    
+                    # Submit batch for processing
+                    future = executor.submit(
+                        processor.process_batch,
+                        chunk_df,
+                        batch_id,
+                        text_column
                     )
+                    futures[future] = batch_id
+                    batch_id += 1
                     
-                    # Process each extracted turn
-                    for turn_idx, (timestamp, speaker, dialogue) in enumerate(turn_matches):
-                        # Vectorized analysis for single turn
-                        turn_sentiment = self.vectorized_engine.vectorized_sentiment_pipeline(
-                            pa.array([dialogue]), self.vader_analyzer
-                        )
+                    # Update progress
+                    progress = min(batch_id / estimated_batches, 0.99)
+                    progress_bar.progress(progress)
+                    status_text.text(f"Processing batch {batch_id}/{estimated_batches}")
+                    
+                    # Process completed futures
+                    for future in as_completed(futures):
+                        batch_num = futures[future]
+                        try:
+                            success, rows_processed, partition_path = future.result(timeout=SAFETY_TIMEOUT)
+                            if success:
+                                successful_batches.append(batch_num)
+                                total_rows += rows_processed
+                                
+                                # Update metrics
+                                with metrics_container:
+                                    col1, col2, col3, col4 = st.columns(4)
+                                    col1.metric("Rows Processed", f"{total_rows:,}")
+                                    col2.metric("Successful Batches", len(successful_batches))
+                                    col3.metric("Failed Batches", len(failed_batches))
+                                    col4.metric("Time Elapsed", f"{time.time() - start_time:.1f}s")
+                            else:
+                                failed_batches.append(batch_num)
+                        except Exception as e:
+                            logger.error(f"Batch {batch_num} failed: {str(e)}")
+                            failed_batches.append(batch_num)
                         
-                        turn_themes = self.vectorized_engine.bulk_theme_analysis(
-                            pa.array([dialogue]), self.coaching_themes
-                        )
+                        del futures[future]
                         
-                        turn_priority = self.vectorized_engine.vectorized_priority_scoring(
-                            turn_themes, self.theme_weights
-                        )
-                        
-                        # Identify primary theme for turn
-                        active_turn_themes = [
-                            theme for theme, data in turn_themes.items()
-                            if data['matches_array'][0].as_py()
-                        ]
-                        primary_theme = active_turn_themes[0] if active_turn_themes else 'none'
-                        
-                        # Compile turn analysis result
-                        turn_analysis_results.append({
-                            'transcript_id': transcript_idx,
-                            'turn_number': turn_idx + 1,
-                            'timestamp': timestamp.strip(),
-                            'speaker': speaker.strip().upper(),
-                            'dialogue_preview': dialogue[:100] + '...' if len(dialogue) > 100 else dialogue,
-                            'sentiment_score': round(turn_sentiment['vader_compound'][0].as_py(), 3),
-                            'coaching_priority': round(turn_priority[0].as_py(), 2),
-                            'primary_theme': primary_theme,
-                            'theme_count': len(active_turn_themes),
-                            'dialogue_length': len(dialogue)
-                        })
-                        
-                except Exception as turn_error:
-                    # Continue processing other turns if individual turn fails
-                    continue
+                        # Force garbage collection periodically
+                        if batch_num % 10 == 0:
+                            gc.collect()
+        
+        elif file_extension in ['xlsx', 'xls']:
+            # For Excel files, read in chunks using openpyxl
+            df = pd.read_excel(uploaded_file, engine='openpyxl')
+            total_rows_excel = len(df)
+            estimated_batches = (total_rows_excel // BATCH_SIZE) + 1
+            st.session_state.total_batches = estimated_batches
+            
+            # Process in batches
+            with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = []
                 
-                # Update progress
-                progress_tracker.progress((transcript_idx + 1) / len(text_column))
+                for i in range(0, total_rows_excel, BATCH_SIZE):
+                    batch_df = df.iloc[i:i+BATCH_SIZE]
+                    
+                    future = executor.submit(
+                        processor.process_batch,
+                        batch_df,
+                        batch_id,
+                        text_column
+                    )
+                    futures.append((future, batch_id))
+                    batch_id += 1
+                    
+                    # Update progress
+                    progress = min(batch_id / estimated_batches, 0.99)
+                    progress_bar.progress(progress)
+                    status_text.text(f"Processing batch {batch_id}/{estimated_batches}")
+                
+                # Collect results
+                for future, batch_num in futures:
+                    try:
+                        success, rows_processed, partition_path = future.result(timeout=SAFETY_TIMEOUT)
+                        if success:
+                            successful_batches.append(batch_num)
+                            total_rows += rows_processed
+                        else:
+                            failed_batches.append(batch_num)
+                    except Exception as e:
+                        logger.error(f"Batch {batch_num} failed: {str(e)}")
+                        failed_batches.append(batch_num)
+                    
+                    # Update metrics
+                    with metrics_container:
+                        col1, col2, col3, col4 = st.columns(4)
+                        col1.metric("Rows Processed", f"{total_rows:,}")
+                        col2.metric("Successful Batches", len(successful_batches))
+                        col3.metric("Failed Batches", len(failed_batches))
+                        col4.metric("Time Elapsed", f"{time.time() - start_time:.1f}s")
+                    
+                    gc.collect()
+        
+        # Combine all partitions into final result
+        if successful_batches:
+            status_text.text("Combining results...")
             
-            # Convert to DataFrame for analysis
-            turn_analysis_df = pd.DataFrame(turn_analysis_results)
-            st.success(f"✅ Vectorized turn analysis completed: {len(turn_analysis_df)} turns analyzed")
+            # Read all successful partitions
+            partition_files = sorted(processor.temp_dir.glob("batch_*.parquet"))
+            tables = []
             
-            return turn_analysis_df
+            for partition_file in partition_files:
+                table = pq.read_table(
+                    partition_file,
+                    memory_map=True  # Memory efficient reading
+                )
+                tables.append(table)
             
-        except Exception as e:
-            st.error(f"Vectorized turn analysis failed: {str(e)}")
+            # Concatenate tables
+            if tables:
+                combined_table = pa.concat_tables(tables)
+                
+                # Write final result
+                final_path = processor.temp_dir / "final_results.parquet"
+                pq.write_table(
+                    combined_table,
+                    final_path,
+                    compression='zstd',
+                    compression_level=ZSTD_COMPRESSION_LEVEL,
+                    use_dictionary=False,
+                    row_group_size=PARQUET_ROW_GROUP_SIZE
+                )
+                
+                st.session_state.results_path = final_path
+                
+                # Update final metrics
+                processing_time = time.time() - start_time
+                st.session_state.processing_metrics = {
+                    'total_rows': total_rows,
+                    'successful_batches': len(successful_batches),
+                    'failed_batches': len(failed_batches),
+                    'processing_time': processing_time,
+                    'rows_per_second': total_rows / processing_time if processing_time > 0 else 0
+                }
+                
+                progress_bar.progress(1.0)
+                status_text.text("Processing complete!")
+                
+                return final_path
+        else:
+            st.error("No batches processed successfully")
             return None
+            
+    except Exception as e:
+        logger.error(f"Processing failed: {str(e)}")
+        st.error(f"Processing failed: {str(e)}")
+        return None
+    finally:
+        # Clean up partition files to save space
+        for partition_file in processor.temp_dir.glob("batch_*.parquet"):
+            try:
+                partition_file.unlink()
+            except:
+                pass
 
-def calculate_file_hash(uploaded_file):
-    """Generate unique hash for uploaded file content"""
-    file_content = uploaded_file.getvalue()
-    return hashlib.md5(file_content).hexdigest()
-
-def load_and_optimize_file(uploaded_file):
-    """Load file and convert to optimized Arrow Parquet format"""
+def load_results_streaming(results_path, sample_size=None):
+    """Load results using streaming for memory efficiency"""
+    if not results_path or not results_path.exists():
+        return None
+    
     try:
-        # Check for cached file
-        file_hash = calculate_file_hash(uploaded_file)
-        
-        if (st.session_state.file_hash == file_hash and 
-            st.session_state.parquet_table is not None):
-            st.info("📋 Using cached optimized Parquet data")
-            return st.session_state.parquet_table, st.session_state.compression_stats
-        
-        # Determine file type and load accordingly
-        filename = uploaded_file.name
-        file_extension = filename.split('.')[-1].lower()
-        
-        with st.spinner(f"Loading {filename}..."):
-            if file_extension == 'csv':
-                dataframe = pd.read_csv(uploaded_file)
-            elif file_extension in ['xlsx', 'xls']:
-                dataframe = pd.read_excel(uploaded_file)
-            else:
-                st.error("Unsupported file format. Please upload CSV, XLS, or XLSX files.")
-                return None, {}
-            
-            st.success(f"📁 File loaded successfully: {len(dataframe)} rows, {len(dataframe.columns)} columns")
-            
-            # Convert to optimized Arrow Parquet
-            vectorized_engine = ArrowVectorizedEngine()
-            optimized_table, compression_stats = vectorized_engine.convert_to_optimized_parquet(
-                dataframe, filename
+        if sample_size:
+            # Load only a sample for preview
+            table = pq.read_table(
+                results_path,
+                memory_map=True,
+                columns=None,  # Load all columns
+                use_pandas_metadata=True
             )
             
-            # Update session state with new data
-            st.session_state.file_hash = file_hash
+            # Sample rows
+            total_rows = table.num_rows
+            if total_rows > sample_size:
+                indices = np.random.choice(total_rows, sample_size, replace=False)
+                indices = pa.array(sorted(indices))
+                table = pc.take(table, indices)
             
-            return optimized_table, compression_stats
+            return table.to_pandas()
+        else:
+            # Stream full results
+            return pq.read_pandas(
+                results_path,
+                memory_map=True
+            ).to_pandas()
     
     except Exception as e:
-        st.error(f"File loading error: {str(e)}")
-        return None, {}
-
-def create_optimized_parquet_export(results_df, turn_analysis_df=None):
-    """Create highly optimized Parquet files for export"""
-    try:
-        # Convert main results to optimized Parquet
-        results_table = pa.Table.from_pandas(results_df)
-        results_buffer = BytesIO()
-        pq.write_table(
-            results_table,
-            results_buffer,
-            compression='zstd',
-            compression_level=6, 
-            use_dictionary=False,
-            write_statistics=True,
-            use_byte_stream_split=False,
-            
-        )
-        results_buffer.seek(0)
-        
-        export_data = {
-            'coaching_analysis': results_buffer.getvalue()
-        }
-        
-        # Add turn analysis if available
-        if turn_analysis_df is not None:
-            turn_table = pa.Table.from_pandas(turn_analysis_df)
-            turn_buffer = BytesIO()
-            pq.write_table(
-                turn_table,
-                turn_buffer,
-                compression='zstd',
-                compression_level=6,
-                use_dictionary=False,
-                write_statistics=True,
-                use_byte_stream_split=False,
-                
-            )
-            turn_buffer.seek(0)
-            export_data['turn_analysis'] = turn_buffer.getvalue()
-        
-        return export_data
-        
-    except Exception as e:
-        st.error(f"Optimized Parquet export failed: {str(e)}")
+        logger.error(f"Failed to load results: {str(e)}")
+        st.error(f"Failed to load results: {str(e)}")
         return None
 
-def apply_arrow_filtering(dataframe, theme_filter, priority_filter):
-    """Apply filters using Arrow compute operations for maximum performance"""
+def export_results_chunked(results_path, export_format='csv', chunk_size=50000):
+    """Export results in chunks for Power BI compatibility"""
+    if not results_path or not results_path.exists():
+        st.error("No results to export")
+        return None
+    
     try:
-        # Convert DataFrame to Arrow table for filtering
-        arrow_table = pa.Table.from_pandas(dataframe)
+        # Read the parquet file
+        table = pq.read_table(results_path, memory_map=True)
+        total_rows = table.num_rows
+        num_chunks = (total_rows // chunk_size) + (1 if total_rows % chunk_size else 0)
         
-        # Apply theme filter with Arrow compute
-        if theme_filter != 'All':
-            theme_condition = pc.equal(arrow_table.column('top_coaching_theme'), theme_filter)
-            arrow_table = arrow_table.filter(theme_condition)
+        export_files = []
         
-        # Apply priority filter with Arrow compute
-        if priority_filter != 'All':
-            if priority_filter == 'Critical (< -2)':
-                priority_condition = pc.less(arrow_table.column('coaching_priority_score'), -2)
-            elif priority_filter == 'Needs Improvement (< 0)':
-                priority_condition = pc.less(arrow_table.column('coaching_priority_score'), 0)
-            elif priority_filter == 'Good Performance (> 2)':
-                priority_condition = pc.greater(arrow_table.column('coaching_priority_score'), 2)
-            else:
-                priority_condition = None
+        for chunk_id in range(num_chunks):
+            start_idx = chunk_id * chunk_size
+            end_idx = min((chunk_id + 1) * chunk_size, total_rows)
             
-            if priority_condition is not None:
-                arrow_table = arrow_table.filter(priority_condition)
+            # Get chunk
+            chunk_table = table.slice(start_idx, end_idx - start_idx)
+            chunk_df = chunk_table.to_pandas()
+            
+            if export_format == 'csv':
+                # Export to CSV
+                buffer = StringIO()
+                chunk_df.to_csv(buffer, index=False)
+                export_files.append({
+                    'name': f'results_chunk_{chunk_id + 1:03d}.csv',
+                    'data': buffer.getvalue(),
+                    'mime': 'text/csv'
+                })
+            elif export_format == 'parquet':
+                # Export to Parquet
+                buffer = BytesIO()
+                pq.write_table(
+                    pa.Table.from_pandas(chunk_df),
+                    buffer,
+                    compression='snappy',  # Good for Power BI
+                    use_dictionary=False
+                )
+                buffer.seek(0)
+                export_files.append({
+                    'name': f'results_chunk_{chunk_id + 1:03d}.parquet',
+                    'data': buffer.getvalue(),
+                    'mime': 'application/octet-stream'
+                })
         
-        # Convert back to DataFrame for display
-        return arrow_table.to_pandas()
+        return export_files
         
     except Exception as e:
-        st.warning(f"Arrow filtering failed: {str(e)}. Using pandas fallback.")
-        # Pandas fallback for filtering
-        filtered_df = dataframe.copy()
-        
-        if theme_filter != 'All':
-            filtered_df = filtered_df[filtered_df['top_coaching_theme'] == theme_filter]
-        
-        if priority_filter != 'All':
-            if priority_filter == 'Critical (< -2)':
-                filtered_df = filtered_df[filtered_df['coaching_priority_score'] < -2]
-            elif priority_filter == 'Needs Improvement (< 0)':
-                filtered_df = filtered_df[filtered_df['coaching_priority_score'] < 0]
-            elif priority_filter == 'Good Performance (> 2)':
-                filtered_df = filtered_df[filtered_df['coaching_priority_score'] > 2]
-        
-        return filtered_df
+        logger.error(f"Export failed: {str(e)}")
+        st.error(f"Export failed: {str(e)}")
+        return None
 
-def apply_turn_filtering(turn_df, speaker_filter, priority_filter):
-    """Apply turn-specific filters using Arrow compute operations"""
-    try:
-        # Convert to Arrow table for filtering
-        arrow_table = pa.Table.from_pandas(turn_df)
-        
-        # Apply speaker filter
-        if speaker_filter != 'All':
-            speaker_condition = pc.equal(arrow_table.column('speaker'), speaker_filter)
-            arrow_table = arrow_table.filter(speaker_condition)
-        
-        # Apply priority filter
-        if priority_filter == 'Critical Turns (< -2)':
-            priority_condition = pc.less(arrow_table.column('coaching_priority'), -2)
-            arrow_table = arrow_table.filter(priority_condition)
-        elif priority_filter == 'Positive Turns (> 1)':
-            priority_condition = pc.greater(arrow_table.column('coaching_priority'), 1)
-            arrow_table = arrow_table.filter(priority_condition)
-        
-        return arrow_table.to_pandas()
-        
-    except Exception as e:
-        st.warning(f"Arrow turn filtering failed: {str(e)}. Using pandas fallback.")
-        # Pandas fallback
-        filtered_turns = turn_df.copy()
-        
-        if speaker_filter != 'All':
-            filtered_turns = filtered_turns[filtered_turns['speaker'] == speaker_filter]
-        
-        if priority_filter == 'Critical Turns (< -2)':
-            filtered_turns = filtered_turns[filtered_turns['coaching_priority'] < -2]
-        elif priority_filter == 'Positive Turns (> 1)':
-            filtered_turns = filtered_turns[filtered_turns['coaching_priority'] > 1]
-        
-        return filtered_turns
-
-def compute_vectorized_metrics(dataframe):
-    """Compute summary metrics using Arrow operations for maximum speed"""
-    try:
-        # Convert to Arrow table for computations
-        arrow_table = pa.Table.from_pandas(dataframe)
-        
-        # Vectorized metric calculations using Arrow compute
-        avg_nps = pc.mean(arrow_table.column('predicted_nps')).as_py()
-        avg_sentiment = pc.mean(arrow_table.column('vader_compound')).as_py()
-        avg_priority = pc.mean(arrow_table.column('coaching_priority_score')).as_py()
-        
-        # Count critical issues using Arrow compute
-        critical_condition = pc.less(arrow_table.column('coaching_priority_score'), -2)
-        critical_count = pc.sum(pc.cast(critical_condition, pa.int64())).as_py()
-        
-        # Sum total turns using Arrow compute
-        total_turns = pc.sum(arrow_table.column('total_turns')).as_py()
-        
-        return {
-            'avg_nps': avg_nps,
-            'avg_sentiment': avg_sentiment,
-            'avg_priority': avg_priority,
-            'critical_count': critical_count,
-            'total_turns': total_turns
-        }
-        
-    except Exception as e:
-        st.warning(f"Arrow metrics computation failed: {str(e)}. Using pandas fallback.")
-        # Pandas fallback
-        return {
-            'avg_nps': dataframe['predicted_nps'].mean(),
-            'avg_sentiment': dataframe['vader_compound'].mean(),
-            'avg_priority': dataframe['coaching_priority_score'].mean(),
-            'critical_count': len(dataframe[dataframe['coaching_priority_score'] < -2]),
-            'total_turns': dataframe['total_turns'].sum()
-        }
-
-def compute_turn_metrics_vectorized(turn_df):
-    """Compute turn analysis metrics using vectorized Arrow operations"""
-    try:
-        # Convert to Arrow table
-        turn_table = pa.Table.from_pandas(turn_df)
-        
-        # Vectorized turn metric calculations
-        agent_count = pc.sum(pc.cast(pc.equal(turn_table.column('speaker'), 'AGENT'), pa.int64())).as_py()
-        customer_count = pc.sum(pc.cast(pc.equal(turn_table.column('speaker'), 'CUSTOMER'), pa.int64())).as_py()
-        critical_turns = pc.sum(pc.cast(pc.less(turn_table.column('coaching_priority'), -2), pa.int64())).as_py()
-        avg_sentiment = pc.mean(turn_table.column('sentiment_score')).as_py()
-        
-        return {
-            'agent_count': agent_count,
-            'customer_count': customer_count,
-            'critical_turns': critical_turns,
-            'avg_sentiment': avg_sentiment
-        }
-        
-    except Exception as e:
-        st.warning(f"Arrow turn metrics failed: {str(e)}. Using pandas fallback.")
-        # Pandas fallback
-        return {
-            'agent_count': len(turn_df[turn_df['speaker'] == 'AGENT']),
-            'customer_count': len(turn_df[turn_df['speaker'] == 'CUSTOMER']),
-            'critical_turns': len(turn_df[turn_df['coaching_priority'] < -2]),
-            'avg_sentiment': turn_df['sentiment_score'].mean()
-        }
+def display_analysis_dashboard(results_df):
+    """Display analysis dashboard with key metrics"""
+    st.subheader("📊 Analysis Dashboard")
+    
+    # Calculate metrics
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    with col1:
+        avg_sentiment = results_df['sentiment_compound'].mean()
+        st.metric("Avg Sentiment", f"{avg_sentiment:.3f}")
+    
+    with col2:
+        avg_nps = results_df['predicted_nps'].mean()
+        st.metric("Avg NPS", f"{avg_nps:.1f}")
+    
+    with col3:
+        avg_priority = results_df['coaching_priority'].mean()
+        st.metric("Avg Priority", f"{avg_priority:.2f}")
+    
+    with col4:
+        critical_count = len(results_df[results_df['coaching_priority'] < -2])
+        st.metric("Critical Issues", f"{critical_count:,}")
+    
+    with col5:
+        positive_count = len(results_df[results_df['coaching_priority'] > 2])
+        st.metric("Positive Examples", f"{positive_count:,}")
+    
+    # Theme distribution
+    st.subheader("🎯 Theme Distribution")
+    theme_counts = {}
+    for themes_str in results_df['themes'].dropna():
+        if themes_str and themes_str != 'none':
+            for theme in themes_str.split(','):
+                theme_counts[theme] = theme_counts.get(theme, 0) + 1
+    
+    if theme_counts:
+        theme_df = pd.DataFrame([
+            {'Theme': k, 'Count': v} 
+            for k, v in sorted(theme_counts.items(), key=lambda x: x[1], reverse=True)
+        ])
+        st.bar_chart(theme_df.set_index('Theme'))
+    
+    # Sample results
+    st.subheader("📝 Sample Results")
+    
+    # Filter options
+    col1, col2 = st.columns(2)
+    with col1:
+        sentiment_filter = st.selectbox(
+            "Filter by sentiment",
+            ["All", "Positive (>0.5)", "Neutral (-0.5 to 0.5)", "Negative (<-0.5)"]
+        )
+    
+    with col2:
+        priority_filter = st.selectbox(
+            "Filter by priority",
+            ["All", "Critical (<-2)", "Needs Attention (<0)", "Good (>0)", "Excellent (>2)"]
+        )
+    
+    # Apply filters
+    filtered_df = results_df.copy()
+    
+    if sentiment_filter == "Positive (>0.5)":
+        filtered_df = filtered_df[filtered_df['sentiment_compound'] > 0.5]
+    elif sentiment_filter == "Neutral (-0.5 to 0.5)":
+        filtered_df = filtered_df[
+            (filtered_df['sentiment_compound'] >= -0.5) & 
+            (filtered_df['sentiment_compound'] <= 0.5)
+        ]
+    elif sentiment_filter == "Negative (<-0.5)":
+        filtered_df = filtered_df[filtered_df['sentiment_compound'] < -0.5]
+    
+    if priority_filter == "Critical (<-2)":
+        filtered_df = filtered_df[filtered_df['coaching_priority'] < -2]
+    elif priority_filter == "Needs Attention (<0)":
+        filtered_df = filtered_df[filtered_df['coaching_priority'] < 0]
+    elif priority_filter == "Good (>0)":
+        filtered_df = filtered_df[filtered_df['coaching_priority'] > 0]
+    elif priority_filter == "Excellent (>2)":
+        filtered_df = filtered_df[filtered_df['coaching_priority'] > 2]
+    
+    # Display filtered results
+    st.info(f"Showing {len(filtered_df):,} of {len(results_df):,} results")
+    
+    # Show sample
+    display_columns = [
+        'text_preview', 'sentiment_compound', 'themes', 
+        'coaching_priority', 'predicted_nps'
+    ]
+    
+    st.dataframe(
+        filtered_df[display_columns].head(100),
+        use_container_width=True,
+        hide_index=True
+    )
 
 def main():
-    """Main application function with complete vectorized processing pipeline"""
-    # Initialize session state
+    """Main application with production-ready features"""
     initialize_session_state()
     
-    st.title("📞 Call Center Agent Coaching Analytics")
-    st.markdown("*Advanced Vectorized Arrow Compute Operations for Maximum Performance*")
+    st.title("📞 Call Center Coaching Analytics")
+    st.markdown("*Production-ready pipeline for 200k+ transcript processing*")
     
-    # Advanced sidebar configuration
+    # Sidebar configuration
     with st.sidebar:
-        st.header("🔧 Advanced Configuration")
+        st.header("⚙️ Configuration")
         
-        # Processing options
-        st.subheader("🚀 Processing Options")
-        enable_vectorized_operations = st.checkbox(
-            "Enable Vectorized Arrow Operations", 
-            value=True, 
-            help="Use PyArrow compute functions for maximum performance"
-        )
-        enable_advanced_caching = st.checkbox(
-            "Enable Advanced Arrow Caching", 
-            value=True, 
-            help="Cache vectorized results for instant re-processing"
+        # Processing settings
+        st.subheader("Processing Settings")
+        batch_size = st.number_input(
+            "Batch Size",
+            min_value=1000,
+            max_value=20000,
+            value=BATCH_SIZE,
+            step=1000,
+            help="Number of rows to process per batch"
         )
         
-        # Performance statistics
-        st.subheader("📊 Performance Statistics")
-        total_cache_entries = len(st.session_state.processing_cache) + len(st.session_state.arrow_cache)
-        st.metric("Total Cache Entries", total_cache_entries)
+        max_workers = st.number_input(
+            "Max Workers",
+            min_value=1,
+            max_value=mp.cpu_count(),
+            value=MAX_WORKERS,
+            help="Number of parallel workers"
+        )
         
-        # Display optimization statistics
-        if st.session_state.compression_stats and st.session_state.compression_stats.get('arrow_optimized'):
-            stats = st.session_state.compression_stats
-            
-            perf_col1, perf_col2 = st.columns(2)
-            with perf_col1:
-                st.metric("Memory Saved", f"{stats.get('memory_savings', 0):.1f} MB")
-            with perf_col2:
-                st.metric("Compression Ratio", f"{stats.get('compression_ratio', 0):.1f}%")
-            
-            st.success("🚀 Arrow Optimization Active")
-            st.metric("Row Groups", stats.get('row_groups', 0))
+        # Display system info
+        st.subheader("System Info")
+        st.info(f"""
+        - CPU Cores: {mp.cpu_count()}
+        - Temp Directory: {TEMP_DIR}
+        - Results Directory: {RESULTS_DIR}
+        """)
         
-        # Cache management
-        if st.button("🗑️ Clear All Caches", help="Clear all cached data and processing results"):
-            st.session_state.processing_cache.clear()
-            st.session_state.arrow_cache.clear()
-            st.session_state.parquet_table = None
-            st.session_state.file_hash = None
-            st.session_state.compression_stats = {}
-            st.success("All caches cleared successfully")
-            st.rerun()
+        # Processing metrics
+        if st.session_state.processing_metrics:
+            st.subheader("Last Processing Metrics")
+            metrics = st.session_state.processing_metrics
+            st.metric("Total Rows", f"{metrics['total_rows']:,}")
+            st.metric("Processing Time", f"{metrics['processing_time']:.1f}s")
+            st.metric("Throughput", f"{metrics['rows_per_second']:.0f} rows/s")
         
-        # File upload section
-        st.subheader("📁 File Upload")
+        # File upload
+        st.subheader("📁 Data Upload")
         uploaded_file = st.file_uploader(
-            "Upload call transcript file",
+            "Upload transcript file",
             type=['csv', 'xlsx', 'xls'],
-            help="Supported formats: CSV, Excel (.xlsx, .xls)"
+            help="Supports CSV and Excel files up to 200k rows"
         )
-        
-        # Format help section
-        st.subheader("📝 Transcript Format Support")
-        st.info("Optimized for embedded format: [HH:MM:SS SPEAKER]: dialogue")
-        
-        with st.expander("📋 Format Examples"):
-            st.code("""[10:00:00 AGENT]: Hello, how can I help you today?
-[10:00:15 CUSTOMER]: I have an issue with my recent order
-[10:00:30 AGENT]: I completely understand your concern""")
     
-    # Main processing area
+    # Main content area
     if uploaded_file is not None:
-        # Load and optimize file
-        if not st.session_state.file_uploaded or st.session_state.get('last_file') != uploaded_file.name:
-            optimized_table, compression_stats = load_and_optimize_file(uploaded_file)
-            
-            if optimized_table is not None:
-                st.session_state.parquet_table = optimized_table
-                st.session_state.compression_stats = compression_stats
-                st.session_state.file_uploaded = True
-                st.session_state.last_file = uploaded_file.name
+        st.subheader("📋 File Information")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.info(f"**File:** {uploaded_file.name}")
+        with col2:
+            file_size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
+            st.info(f"**Size:** {file_size_mb:.1f} MB")
+        with col3:
+            file_type = uploaded_file.name.split('.')[-1].upper()
+            st.info(f"**Type:** {file_type}")
+        
+        # Column selection
+        st.subheader("🎯 Column Configuration")
+        
+        # Quick preview to get columns
+        try:
+            if file_type == 'CSV':
+                preview_df = pd.read_csv(uploaded_file, nrows=5)
             else:
-                st.stop()
-        else:
-            optimized_table = st.session_state.parquet_table
-        
-        # Column configuration from Arrow table
-        st.subheader("🎯 Advanced Column Configuration")
-        config_col1, config_col2 = st.columns(2)
-        
-        # Get column names directly from Arrow table
-        available_columns = optimized_table.column_names
-        
-        with config_col1:
+                preview_df = pd.read_excel(uploaded_file, nrows=5)
+            
+            columns = preview_df.columns.tolist()
+            
             text_column = st.selectbox(
-                "Select Text/Transcript Column",
-                options=available_columns,
-                help="Column containing conversation transcripts with embedded speaker/timestamp format"
+                "Select text/transcript column",
+                options=columns,
+                help="Column containing the conversation text"
             )
+            
+            # Show preview
+            if st.checkbox("Show data preview"):
+                st.dataframe(preview_df, use_container_width=True)
+            
+            uploaded_file.seek(0)  # Reset file pointer
+            
+        except Exception as e:
+            st.error(f"Error reading file: {str(e)}")
+            st.stop()
         
-        with config_col2:
-            additional_columns = st.multiselect(
-                "Select additional output columns",
-                options=[col for col in available_columns if col != text_column],
-                help="Additional columns to include in final analysis output"
-            )
+        # Process button
+        col1, col2 = st.columns(2)
         
-        # Advanced processing button
-        if st.button("🚀 Launch Vectorized Analysis", type="primary"):
-            if not enable_vectorized_operations:
-                st.error("Vectorized operations are disabled. Please enable them for processing.")
-                st.stop()
-            
-            # Initialize vectorized analyzer
-            vectorized_analyzer = CallCenterVectorizedAnalyzer()
-            
-            with st.spinner("Executing advanced vectorized Arrow compute operations..."):
-                processing_start_time = time.time()
+        with col1:
+            if st.button("🚀 Start Processing", type="primary", use_container_width=True):
+                st.session_state.processing_status = "running"
                 
-                # Main vectorized processing
-                analysis_results = vectorized_analyzer.process_parquet_table_vectorized(
-                    optimized_table, text_column
-                )
+                with st.spinner("Initializing streaming pipeline..."):
+                    results_path = process_file_streaming(uploaded_file, text_column)
                 
-                if analysis_results is not None:
-                    # Add additional columns from Arrow table
-                    for additional_col in additional_columns:
-                        if additional_col in available_columns:
-                            additional_data = optimized_table.column(additional_col).to_pylist()
-                            analysis_results[additional_col] = additional_data[:len(analysis_results)]
-                    
-                    processing_duration = time.time() - processing_start_time
-                    
-                    st.session_state.processed_data = analysis_results
-                    st.success(f"✅ Vectorized analysis completed in {processing_duration:.2f} seconds!")
+                if results_path:
+                    st.session_state.processing_status = "complete"
+                    st.success("✅ Processing complete!")
+                    st.balloons()
                 else:
-                    st.error("Vectorized analysis failed. Please check your data and try again.")
+                    st.session_state.processing_status = "failed"
+                    st.error("Processing failed. Check logs for details.")
         
-        # Results display and analysis
-        if st.session_state.processed_data is not None:
-            results_dataframe = st.session_state.processed_data
+        with col2:
+            if st.button("🔄 Reset", type="secondary", use_container_width=True):
+                # Clear session state
+                for key in list(st.session_state.keys()):
+                    del st.session_state[key]
+                # Clear temp files
+                if RESULTS_DIR.exists():
+                    shutil.rmtree(RESULTS_DIR)
+                st.rerun()
+        
+        # Display results if available
+        if st.session_state.processing_status == "complete" and st.session_state.results_path:
+            st.markdown("---")
             
-            # Processing method indicator
-            if 'processing_method' in results_dataframe.columns:
-                processing_method = results_dataframe['processing_method'].iloc[0]
-                if 'vectorized_arrow' in processing_method:
-                    st.success(f"🚀 Results generated using: {processing_method}")
-            
-            # Advanced summary metrics using Arrow compute
-            st.subheader("📈 Advanced Analysis Summary")
-            
-            # Compute metrics using vectorized operations
-            summary_metrics = compute_vectorized_metrics(results_dataframe)
-            
-            summary_col1, summary_col2, summary_col3, summary_col4, summary_col5 = st.columns(5)
-            
-            with summary_col1:
-                st.metric("Average NPS", f"{summary_metrics['avg_nps']:.1f}")
-            
-            with summary_col2:
-                st.metric("Average Sentiment", f"{summary_metrics['avg_sentiment']:.2f}")
-            
-            with summary_col3:
-                st.metric("Avg Coaching Priority", f"{summary_metrics['avg_priority']:.1f}")
-            
-            with summary_col4:
-                st.metric("Critical Issues", summary_metrics['critical_count'])
-            
-            with summary_col5:
-                st.metric("Total Turns", summary_metrics['total_turns'])
-            
-            # Advanced coaching priority breakdown using Arrow filtering
-            st.subheader("🎯 Advanced Coaching Priority Breakdown")
-            
-            breakdown_col1, breakdown_col2 = st.columns(2)
-            
-            with breakdown_col1:
-                # Critical issues using Arrow filtering
-                critical_issues = apply_arrow_filtering(results_dataframe, 'All', 'Critical (< -2)')
-                if len(critical_issues) > 0:
-                    st.error(f"🚨 {len(critical_issues)} transcripts require immediate intervention")
-                    critical_display_cols = [
-                        col for col in ['coaching_priority_score', 'top_coaching_theme', 'vader_compound']
-                        if col in critical_issues.columns
-                    ]
-                    st.dataframe(
-                        critical_issues[critical_display_cols].head(),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                else:
-                    st.success("✅ No critical coaching issues identified")
-            
-            with breakdown_col2:
-                # Positive examples using Arrow filtering
-                positive_examples = apply_arrow_filtering(results_dataframe, 'All', 'Good Performance (> 2)')
-                if len(positive_examples) > 0:
-                    st.success(f"⭐ {len(positive_examples)} examples of excellent performance")
-                    positive_display_cols = [
-                        col for col in ['coaching_priority_score', 'top_coaching_theme', 'vader_compound']
-                        if col in positive_examples.columns
-                    ]
-                    st.dataframe(
-                        positive_examples[positive_display_cols].head(),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                else:
-                    st.info("💡 Consider highlighting positive coaching examples")
-            
-            # Advanced results table with Arrow filtering
-            st.subheader("🎯 Comprehensive Coaching Analysis Results")
-            
-            # Advanced display options
-            display_col1, display_col2, display_col3 = st.columns(3)
-            
-            with display_col1:
-                default_display_columns = [
-                    'predicted_nps', 'coaching_priority_score', 'top_coaching_theme', 
-                    'vader_compound', 'total_turns', 'theme_count'
-                ]
-                selected_columns = st.multiselect(
-                    "Select display columns",
-                    options=results_dataframe.columns.tolist(),
-                    default=[col for col in default_display_columns if col in results_dataframe.columns]
+            # Load sample for display
+            with st.spinner("Loading results..."):
+                sample_df = load_results_streaming(
+                    st.session_state.results_path,
+                    sample_size=10000  # Load 10k sample for display
                 )
             
-            with display_col2:
-                theme_filter = st.selectbox(
-                    "Filter by coaching theme",
-                    options=['All'] + sorted(results_dataframe['top_coaching_theme'].unique().tolist()),
-                    key="advanced_theme_filter"
-                )
-            
-            with display_col3:
-                priority_filter = st.selectbox(
-                    "Filter by coaching priority",
-                    options=['All', 'Critical (< -2)', 'Needs Improvement (< 0)', 'Good Performance (> 2)'],
-                    key="advanced_priority_filter"
-                )
-            
-            # Apply advanced Arrow filtering
-            filtered_results = apply_arrow_filtering(results_dataframe, theme_filter, priority_filter)
-            
-            # Apply column selection
-            if selected_columns:
-                display_columns = [col for col in selected_columns if col in filtered_results.columns]
-                if display_columns:
-                    filtered_results = filtered_results[display_columns]
-            
-            # Display filtering info
-            st.info(f"Displaying {len(filtered_results)} of {len(results_dataframe)} transcripts")
-            
-            # Main results table
-            if len(filtered_results) > 0:
-                st.dataframe(
-                    filtered_results,
-                    use_container_width=True,
-                    hide_index=True
-                )
-            else:
-                st.warning("No records match the selected filters. Please adjust your filter criteria.")
-            
-            # Advanced turn-by-turn analysis
-            st.subheader("🔄 Advanced Turn-by-Turn Analysis")
-            
-            if st.button("🚀 Generate Vectorized Turn Analysis", type="secondary"):
-                vectorized_analyzer = CallCenterVectorizedAnalyzer()
-                turn_analysis_results = vectorized_analyzer.generate_vectorized_turn_analysis(
-                    optimized_table, text_column
-                )
+            if sample_df is not None:
+                # Display dashboard
+                display_analysis_dashboard(sample_df)
                 
-                if turn_analysis_results is not None and len(turn_analysis_results) > 0:
-                    st.session_state.turn_analysis = turn_analysis_results
-                    
-                    # Advanced turn analysis summary
-                    st.markdown("### Turn Analysis Summary")
-                    turn_summary_col1, turn_summary_col2, turn_summary_col3, turn_summary_col4 = st.columns(4)
-                    
-                    # Compute turn metrics using vectorized operations
-                    turn_metrics = compute_turn_metrics_vectorized(turn_analysis_results)
-                    
-                    with turn_summary_col1:
-                        st.metric("Agent Turns", turn_metrics['agent_count'])
-                    
-                    with turn_summary_col2:
-                        st.metric("Customer Turns", turn_metrics['customer_count'])
-                    
-                    with turn_summary_col3:
-                        st.metric("Critical Turns", turn_metrics['critical_turns'])
-                    
-                    with turn_summary_col4:
-                        st.metric("Avg Turn Sentiment", f"{turn_metrics['avg_sentiment']:.2f}")
-            
-            # Display existing turn analysis
-            if st.session_state.turn_analysis is not None:
-                turn_dataframe = st.session_state.turn_analysis
+                # Export options
+                st.markdown("---")
+                st.subheader("📤 Export Options")
                 
-                # Advanced turn filtering
-                st.markdown("### Advanced Turn Filtering")
-                turn_filter_col1, turn_filter_col2 = st.columns(2)
+                col1, col2, col3 = st.columns(3)
                 
-                with turn_filter_col1:
-                    unique_speakers = ['All'] + sorted(turn_dataframe['speaker'].unique().tolist())
-                    speaker_filter = st.selectbox(
-                        "Filter by speaker type",
-                        options=unique_speakers,
-                        key="advanced_speaker_filter"
-                    )
+                with col1:
+                    if st.button("📊 Export CSV (Chunked)", use_container_width=True):
+                        with st.spinner("Preparing CSV export..."):
+                            export_files = export_results_chunked(
+                                st.session_state.results_path,
+                                export_format='csv',
+                                chunk_size=50000
+                            )
+                        
+                        if export_files:
+                            st.success(f"Generated {len(export_files)} CSV chunks")
+                            for file_data in export_files[:5]:  # Show first 5
+                                st.download_button(
+                                    label=f"Download {file_data['name']}",
+                                    data=file_data['data'],
+                                    file_name=file_data['name'],
+                                    mime=file_data['mime']
+                                )
+                            if len(export_files) > 5:
+                                st.info(f"... and {len(export_files) - 5} more files")
                 
-                with turn_filter_col2:
-                    turn_priority_filter = st.selectbox(
-                        "Filter by turn priority",
-                        options=['All', 'Critical Turns (< -2)', 'Positive Turns (> 1)'],
-                        key="advanced_turn_priority_filter"
-                    )
+                with col2:
+                    if st.button("🗂️ Export Parquet", use_container_width=True):
+                        with st.spinner("Preparing Parquet export..."):
+                            export_files = export_results_chunked(
+                                st.session_state.results_path,
+                                export_format='parquet',
+                                chunk_size=100000
+                            )
+                        
+                        if export_files:
+                            st.success(f"Generated {len(export_files)} Parquet files")
+                            for file_data in export_files:
+                                st.download_button(
+                                    label=f"Download {file_data['name']}",
+                                    data=file_data['data'],
+                                    file_name=file_data['name'],
+                                    mime=file_data['mime']
+                                )
                 
-                # Apply advanced turn filtering
-                filtered_turns = apply_turn_filtering(turn_dataframe, speaker_filter, turn_priority_filter)
-                
-                # Display turn filtering info
-                st.info(f"Displaying {len(filtered_turns)} of {len(turn_dataframe)} turns")
-                
-                # Turn analysis table
-                if len(filtered_turns) > 0:
-                    st.dataframe(
-                        filtered_turns,
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                else:
-                    st.warning("No turns match the selected filters. Please adjust your criteria.")
-            
-            # Advanced export options
-            st.subheader("📤 Advanced Export Options")
-            export_col1, export_col2, export_col3 = st.columns(3)
-            
-            with export_col1:
-                # CSV export
-                csv_data = results_dataframe.to_csv(index=False)
-                st.download_button(
-                    label="📊 Download CSV Analysis",
-                    data=csv_data,
-                    file_name=f"vectorized_coaching_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
-                )
-            
-            with export_col2:
-                # Excel export with multiple sheets
-                excel_buffer = BytesIO()
-                with pd.ExcelWriter(excel_buffer, engine='openpyxl') as excel_writer:
-                    results_dataframe.to_excel(excel_writer, sheet_name='Coaching Analysis', index=False)
-                    if st.session_state.turn_analysis is not None:
-                        st.session_state.turn_analysis.to_excel(excel_writer, sheet_name='Turn Analysis', index=False)
-                
-                st.download_button(
-                    label="📈 Download Excel Report",
-                    data=excel_buffer.getvalue(),
-                    file_name=f"vectorized_coaching_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            
-            with export_col3:
-                # Optimized Parquet export
-                optimized_parquet_data = create_optimized_parquet_export(
-                    results_dataframe, st.session_state.turn_analysis
-                )
-                if optimized_parquet_data:
-                    st.download_button(
-                        label="🚀 Download Optimized Parquet",
-                        data=optimized_parquet_data['coaching_analysis'],
-                        file_name=f"vectorized_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet",
-                        mime="application/octet-stream",
-                        help="Ultra-compressed Parquet format for maximum efficiency"
-                    )
+                with col3:
+                    # Summary report
+                    if st.button("📑 Generate Report", use_container_width=True):
+                        with st.spinner("Generating summary report..."):
+                            report = generate_summary_report(sample_df, st.session_state.processing_metrics)
+                        
+                        st.download_button(
+                            label="Download Report",
+                            data=report,
+                            file_name=f"coaching_report_{datetime.now().strftime('%Y%m%d')}.txt",
+                            mime="text/plain"
+                        )
     
     else:
-        st.info("👈 Please upload a call transcript file to begin vectorized analysis")
+        # Landing page
+        st.info("👈 Upload a transcript file to begin analysis")
         
-        # Comprehensive help and documentation
-        with st.expander("📚 Comprehensive Usage Guide"):
+        # Display usage guide
+        with st.expander("📚 Usage Guide"):
             st.markdown("""
-            ### 🚀 Complete Vectorized Processing Pipeline
+            ### Production Pipeline Features
             
-            1. **File Upload**: Upload CSV or Excel files containing call transcripts
-            2. **Arrow Optimization**: Automatic conversion to Arrow-optimized Parquet with dictionary encoding
-            3. **Column Selection**: Choose transcript column and additional output columns
-            4. **Vectorized Analysis**: Launch pure PyArrow compute operations for maximum performance
-            5. **Results Review**: Examine coaching insights, sentiment analysis, and NPS predictions
-            6. **Turn Analysis**: Generate detailed speaker-by-speaker conversation analysis
-            7. **Advanced Export**: Download in CSV, Excel, or ultra-optimized Parquet formats
+            #### 🚀 Performance Optimizations
+            - **Streaming Processing**: Handles 200k+ rows without loading entire file into memory
+            - **Batch Processing**: Configurable batch sizes (default 5,000 rows)
+            - **Multiprocessing**: Parallel processing with worker pool
+            - **Memory Management**: Automatic garbage collection and memory limits
+            - **Partitioned Storage**: Results stored in partitioned Parquet files
             
-            ### ⚡ Vectorized Arrow Compute Advantages
-            - **🎯 Pure PyArrow Operations**: Zero Python loops, maximum vectorization
-            - **🗜️ Advanced Compression**: Dictionary encoding + Snappy compression
-            - **📊 Bulk Processing**: Simultaneous analysis of entire columns
-            - **💾 Zero-Copy Operations**: Direct Arrow array manipulations
-            - **⚡ Regex Vectorization**: Bulk pattern matching for theme detection
-            - **🚀 Parallel Aggregations**: Arrow compute functions for all metrics
+            #### 💪 Reliability Features
+            - **Error Recovery**: Failed batches tracked and reported
+            - **Timeout Protection**: 5-minute timeout per batch
+            - **Progress Tracking**: Real-time progress and metrics
+            - **Safe Type Casting**: Automatic dictionary-to-string conversion
+            - **Temp File Management**: Automatic cleanup of temporary files
             
-            ### 📝 Supported Transcript Formats
-            - **Embedded Format**: `[HH:MM:SS SPEAKER]: dialogue content`
-            - **Example**: `[10:00:00 AGENT]: I completely understand your concern about this issue`
-            - **Speaker Types**: AGENT, CUSTOMER, REP, CLIENT, ADVISOR, USER, CALLER
-            - **Timestamp Formats**: HH:MM:SS, H:MM:SS (flexible hour format)
+            #### 📊 Analysis Capabilities
+            - **Sentiment Analysis**: VADER sentiment scoring
+            - **Theme Detection**: FlashText keyword extraction (with regex fallback)
+            - **Coaching Priority**: Weighted scoring system
+            - **NPS Prediction**: Sentiment-based NPS estimation
             
-            ### 🎯 Advanced Coaching Analytics Features
-            - **15 Coaching Categories**: Comprehensive theme detection across all interaction types
-            - **Vectorized Sentiment Analysis**: VADER + TextBlob sentiment scoring
-            - **NPS Prediction**: Automated Net Promoter Score estimation
-            - **Priority Scoring**: Weighted coaching urgency calculations
-            - **Speaker Intelligence**: Separate agent vs customer interaction analysis
-            - **Turn-by-Turn Breakdown**: Individual conversation segment analysis
+            #### 📤 Export Options
+            - **Chunked CSV**: Power BI-compatible 50k row chunks
+            - **Parquet Files**: Compressed, efficient format
+            - **Summary Report**: Text report with key metrics
             
-            ### 🏆 Performance Specifications
-            - **Processing Speed**: 10,000+ records processed in seconds
-            - **Memory Efficiency**: Up to 80% reduction through compression
-            - **Cache Performance**: Instant re-processing of analyzed data
-            - **Scalability**: Handles datasets with millions of conversation turns
-            - **Export Options**: Multiple formats optimized for different use cases
+            ### System Requirements
+            - **RAM**: 2GB minimum, 4GB recommended
+            - **Storage**: 2x input file size for processing
+            - **CPU**: Multi-core processor recommended
+            
+            ### File Format Support
+            - **CSV**: Streamed in chunks, any size
+            - **Excel**: .xlsx, .xls (loaded in batches)
+            - **Text Encoding**: UTF-8 recommended
+            
+            ### Performance Expectations
+            - **50k rows**: ~1-2 minutes
+            - **100k rows**: ~2-5 minutes  
+            - **200k rows**: ~5-10 minutes
+            - **500k rows**: ~15-30 minutes
+            
+            *Times vary based on text length and system resources*
             """)
         
-        # Technical specifications
-        with st.expander("⚙️ Technical Specifications"):
+        # Display best practices
+        with st.expander("🏆 Best Practices"):
             st.markdown("""
-            ### 🔧 Arrow Compute Functions Used
-            - `pc.match_substring_regex()`: Vectorized theme detection
-            - `pc.mean()`, `pc.sum()`, `pc.count()`: Bulk aggregations
-            - `pc.filter()`, `pc.equal()`, `pc.less()`, `pc.greater()`: Data filtering
-            - `pc.utf8_lower()`, `pc.utf8_slice_codeunits()`: String operations
-            - `pc.cast()`, `pc.or_()`: Type conversions and logical operations
+            ### Data Preparation
+            1. **Clean Text**: Remove special characters that might break parsing
+            2. **Consistent Format**: Ensure all transcripts follow same structure
+            3. **Reasonable Length**: Transcripts between 100-5000 characters work best
+            4. **UTF-8 Encoding**: Save CSV files with UTF-8 encoding
             
-            ### 📊 Compression Technologies
-            - **Snappy Compression**: Fast compression/decompression
-            - **Dictionary Encoding**: Efficient string storage
-            - **Byte Stream Splitting**: Optimized numeric storage
-            - **Row Group Optimization**: 50,000 record groups for query performance
-            - **Statistics Writing**: Enhanced query optimization
+            ### Optimization Tips
+            1. **Batch Size**: Increase for faster processing (more memory)
+            2. **Worker Count**: Set to CPU cores - 1 for best performance
+            3. **Sample First**: Test with 10k row sample before full processing
+            4. **Monitor Memory**: Watch system memory during processing
             
-            ### 💾 Caching Architecture
-            - **Arrow Cache**: Vectorized processing results
-            - **Processing Cache**: Intermediate analysis states
-            - **File Hash Caching**: Avoid duplicate file processing
-            - **Session State Management**: Persistent data across interactions
+            ### Power BI Integration
+            1. Use chunked CSV export for files >1M rows
+            2. Import Parquet files for better performance
+            3. Set up incremental refresh for large datasets
+            4. Use DirectQuery mode for real-time updates
             """)
+
+def generate_summary_report(df, metrics):
+    """Generate text summary report"""
+    report = []
+    report.append("=" * 50)
+    report.append("CALL CENTER COACHING ANALYSIS REPORT")
+    report.append("=" * 50)
+    report.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    report.append("")
+    
+    # Processing metrics
+    report.append("PROCESSING METRICS")
+    report.append("-" * 30)
+    if metrics:
+        report.append(f"Total Rows Processed: {metrics['total_rows']:,}")
+        report.append(f"Processing Time: {metrics['processing_time']:.1f} seconds")
+        report.append(f"Throughput: {metrics['rows_per_second']:.0f} rows/second")
+        report.append(f"Successful Batches: {metrics['successful_batches']}")
+        report.append(f"Failed Batches: {metrics['failed_batches']}")
+    report.append("")
+    
+    # Analysis summary
+    report.append("ANALYSIS SUMMARY")
+    report.append("-" * 30)
+    report.append(f"Average Sentiment: {df['sentiment_compound'].mean():.3f}")
+    report.append(f"Average NPS: {df['predicted_nps'].mean():.1f}")
+    report.append(f"Average Coaching Priority: {df['coaching_priority'].mean():.2f}")
+    report.append("")
+    
+    # Sentiment distribution
+    report.append("SENTIMENT DISTRIBUTION")
+    report.append("-" * 30)
+    positive = len(df[df['sentiment_compound'] > 0.5])
+    neutral = len(df[(df['sentiment_compound'] >= -0.5) & (df['sentiment_compound'] <= 0.5)])
+    negative = len(df[df['sentiment_compound'] < -0.5])
+    total = len(df)
+    
+    report.append(f"Positive: {positive:,} ({positive/total*100:.1f}%)")
+    report.append(f"Neutral: {neutral:,} ({neutral/total*100:.1f}%)")
+    report.append(f"Negative: {negative:,} ({negative/total*100:.1f}%)")
+    report.append("")
+    
+    # Coaching priorities
+    report.append("COACHING PRIORITY BREAKDOWN")
+    report.append("-" * 30)
+    critical = len(df[df['coaching_priority'] < -2])
+    needs_attention = len(df[(df['coaching_priority'] >= -2) & (df['coaching_priority'] < 0)])
+    good = len(df[(df['coaching_priority'] >= 0) & (df['coaching_priority'] <= 2)])
+    excellent = len(df[df['coaching_priority'] > 2])
+    
+    report.append(f"Critical (<-2): {critical:,} ({critical/total*100:.1f}%)")
+    report.append(f"Needs Attention (-2 to 0): {needs_attention:,} ({needs_attention/total*100:.1f}%)")
+    report.append(f"Good (0 to 2): {good:,} ({good/total*100:.1f}%)")
+    report.append(f"Excellent (>2): {excellent:,} ({excellent/total*100:.1f}%)")
+    report.append("")
+    
+    # Theme analysis
+    report.append("THEME ANALYSIS")
+    report.append("-" * 30)
+    theme_counts = {}
+    for themes_str in df['themes'].dropna():
+        if themes_str and themes_str != 'none':
+            for theme in themes_str.split(','):
+                theme_counts[theme] = theme_counts.get(theme, 0) + 1
+    
+    if theme_counts:
+        for theme, count in sorted(theme_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
+            report.append(f"{theme}: {count:,} occurrences")
+    report.append("")
+    
+    # NPS breakdown
+    report.append("NPS DISTRIBUTION")
+    report.append("-" * 30)
+    promoters = len(df[df['predicted_nps'] >= 9])
+    passives = len(df[(df['predicted_nps'] >= 7) & (df['predicted_nps'] < 9)])
+    detractors = len(df[df['predicted_nps'] < 7])
+    
+    report.append(f"Promoters (9-10): {promoters:,} ({promoters/total*100:.1f}%)")
+    report.append(f"Passives (7-8): {passives:,} ({passives/total*100:.1f}%)")
+    report.append(f"Detractors (0-6): {detractors:,} ({detractors/total*100:.1f}%)")
+    nps_score = (promoters - detractors) / total * 100
+    report.append(f"NPS Score: {nps_score:.1f}")
+    report.append("")
+    
+    # Recommendations
+    report.append("KEY RECOMMENDATIONS")
+    report.append("-" * 30)
+    
+    if critical > total * 0.1:
+        report.append("⚠️ High number of critical issues detected (>10% of calls)")
+        report.append("   - Immediate coaching intervention recommended")
+    
+    if df['sentiment_compound'].mean() < 0:
+        report.append("⚠️ Overall negative sentiment trend")
+        report.append("   - Review common customer pain points")
+    
+    if nps_score < 0:
+        report.append("⚠️ Negative NPS score")
+        report.append("   - Focus on converting detractors to passives")
+    
+    if 'escalation_triggers' in ' '.join(df['themes'].fillna('').tolist()):
+        report.append("⚠️ Escalation triggers detected")
+        report.append("   - Review de-escalation training materials")
+    
+    report.append("")
+    report.append("=" * 50)
+    report.append("END OF REPORT")
+    report.append("=" * 50)
+    
+    return "\n".join(report)
 
 if __name__ == "__main__":
     main()

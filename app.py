@@ -18,6 +18,7 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 try:
     import pyarrow.parquet as pq
     import pyarrow as pa
+    import pyarrow.compute as pc
 except ImportError:
     st.error("Please install pyarrow: pip install pyarrow")
 
@@ -44,13 +45,11 @@ def initialize_session_state():
         st.session_state.processing_cache = {}
     if 'parquet_table' not in st.session_state:
         st.session_state.parquet_table = None
-    if 'parquet_dataframe' not in st.session_state:
-        st.session_state.parquet_dataframe = None
     if 'compression_stats' not in st.session_state:
         st.session_state.compression_stats = {}
 
-class ParquetManager:
-    """Handles all Parquet operations for optimal performance"""
+class ParquetProcessor:
+    """Pure Parquet processing operations for maximum performance"""
     
     @staticmethod
     def convert_to_parquet(df, filename):
@@ -76,9 +75,8 @@ class ParquetManager:
                 )
                 parquet_buffer.seek(0)
                 
-                # Read back the compressed table
+                # Read back the compressed table - KEEP AS PARQUET TABLE
                 compressed_table = pq.read_table(parquet_buffer)
-                compressed_df = compressed_table.to_pandas()
                 
                 # Calculate compression stats
                 compressed_size_bytes = len(parquet_buffer.getvalue())
@@ -106,49 +104,70 @@ class ParquetManager:
                 
                 st.success("✅ Parquet conversion completed with Snappy compression")
                 
-                # Store in session state
+                # Store ONLY Parquet table in session state
                 st.session_state.parquet_table = compressed_table
-                st.session_state.parquet_dataframe = compressed_df
                 st.session_state.compression_stats = compression_stats
                 
-                return compressed_table, compressed_df, compression_stats
+                return compressed_table, compression_stats
                 
         except Exception as e:
             st.error(f"Parquet conversion failed: {str(e)}")
             st.warning("Falling back to original DataFrame - performance may be impacted")
-            return None, df, {}
+            # Convert original DataFrame to Parquet table as fallback
+            table = pa.Table.from_pandas(df)
+            return table, {}
     
     @staticmethod
-    def read_parquet_optimized(parquet_table, columns=None):
-        """Read specific columns from Parquet for memory efficiency"""
+    def get_column_data(parquet_table, column_name):
+        """Extract column data directly from Parquet table"""
         try:
-            if columns:
-                # Only read required columns
-                selected_table = parquet_table.select(columns)
-                return selected_table.to_pandas()
+            column_array = parquet_table.column(column_name)
+            return column_array.to_pylist()
+        except Exception as e:
+            st.error(f"Error reading column {column_name}: {str(e)}")
+            return []
+    
+    @staticmethod
+    def get_row_count(parquet_table):
+        """Get row count directly from Parquet table"""
+        return parquet_table.num_rows
+    
+    @staticmethod
+    def get_column_names(parquet_table):
+        """Get column names directly from Parquet table"""
+        return parquet_table.column_names
+    
+    @staticmethod
+    def filter_parquet_table(parquet_table, column_name, filter_values):
+        """Filter Parquet table directly without DataFrame conversion"""
+        try:
+            if isinstance(filter_values, (list, tuple)):
+                # Multiple values filter
+                filter_expr = pc.is_in(pc.field(column_name), filter_values)
             else:
-                return parquet_table.to_pandas()
+                # Single value filter
+                filter_expr = pc.equal(pc.field(column_name), filter_values)
+            
+            filtered_table = parquet_table.filter(filter_expr)
+            return filtered_table
         except Exception as e:
-            st.error(f"Error reading Parquet data: {str(e)}")
-            return parquet_table.to_pandas()
+            st.warning(f"Parquet filtering failed: {str(e)}, using original table")
+            return parquet_table
     
     @staticmethod
-    def filter_parquet_table(parquet_table, filters=None):
-        """Apply filters directly to Parquet table for better performance"""
+    def select_columns(parquet_table, column_names):
+        """Select specific columns from Parquet table"""
         try:
-            if filters:
-                filtered_table = parquet_table.filter(filters)
-                return filtered_table
-            return parquet_table
+            selected_table = parquet_table.select(column_names)
+            return selected_table
         except Exception as e:
-            # Fallback to DataFrame filtering
+            st.warning(f"Column selection failed: {str(e)}, using original table")
             return parquet_table
 
 class CallCenterAnalyzer:
-    def __init__(self, use_parquet=True):
+    def __init__(self):
         self.vader = SentimentIntensityAnalyzer()
-        self.use_parquet = use_parquet
-        self.parquet_manager = ParquetManager()
+        self.parquet_processor = ParquetProcessor()
         self.coaching_themes = {
             # 1. Empathy & Emotional Intelligence
             "empathy": [
@@ -531,55 +550,16 @@ class CallCenterAnalyzer:
             'quality': quality
         }
     
-    def extract_speaker_turns(self, text, timestamp_col=None, speaker_col=None):
-        """Extract turn-by-turn analysis from embedded format"""
-        turns = self.parse_embedded_transcript(text)
+    def process_parquet_data(self, parquet_table, text_col, parallel=False):
+        """Process Parquet data directly without DataFrame conversion"""
+        st.info("🚀 Processing using pure Parquet operations")
         
-        # If no embedded format found, try legacy pattern matching
-        if not turns:
-            agent_patterns = r'(agent|rep|representative)[:|-]?\s*(.*?)(?=customer|client|caller|$)'
-            customer_patterns = r'(customer|client|caller|user)[:|-]?\s*(.*?)(?=agent|rep|representative|$)'
-            
-            agent_matches = re.findall(agent_patterns, str(text), re.IGNORECASE | re.DOTALL)
-            customer_matches = re.findall(customer_patterns, str(text), re.IGNORECASE | re.DOTALL)
-            
-            for i, match in enumerate(agent_matches):
-                turns.append({
-                    'turn_number': i + 1,
-                    'speaker': 'AGENT',
-                    'text': match[1].strip(),
-                    'timestamp': f"Turn {i+1}"
-                })
-            
-            for i, match in enumerate(customer_matches):
-                turns.append({
-                    'turn_number': i + 1,
-                    'speaker': 'CUSTOMER',
-                    'text': match[1].strip(),
-                    'timestamp': f"Turn {i+1}"
-                })
+        # Generate cache key based on Parquet table
+        row_count = self.parquet_processor.get_row_count(parquet_table)
+        text_data = self.parquet_processor.get_column_data(parquet_table, text_col)
+        first_text = text_data[0][:50] if text_data and len(text_data) > 0 else ''
         
-        return turns
-    
-    def process_transcript_from_parquet(self, text_col, parquet_table=None, parquet_df=None, parallel=False):
-        """Process transcript using Parquet data for optimal performance"""
-        
-        # Use Parquet table if available, otherwise DataFrame
-        if parquet_table is not None and self.use_parquet:
-            st.info("🚀 Processing using optimized Parquet format")
-            # Convert Parquet table to DataFrame for processing
-            df = parquet_table.to_pandas()
-            data_source = "parquet_table"
-        elif parquet_df is not None:
-            st.info("🚀 Processing using Parquet-optimized DataFrame")
-            df = parquet_df
-            data_source = "parquet_dataframe"
-        else:
-            st.error("No Parquet data available for processing")
-            return None
-        
-        # Generate cache key based on Parquet data
-        cache_key = hashlib.md5(f"{text_col}_{len(df)}_{data_source}_{df.iloc[0][text_col][:50] if len(df) > 0 else ''}".encode()).hexdigest()
+        cache_key = hashlib.md5(f"{text_col}_{row_count}_parquet_{first_text}".encode()).hexdigest()
         
         # Check cache first
         if cache_key in st.session_state.processing_cache:
@@ -588,16 +568,18 @@ class CallCenterAnalyzer:
         
         results = []
         
-        def process_row_optimized(row):
-            text = row[text_col]
-            
+        def process_text_item(text_item):
+            """Process individual text item from Parquet data"""
+            if not text_item:
+                return None
+                
             # Parse embedded transcript for speaker-specific analysis
-            turns = self.parse_embedded_transcript(text)
+            turns = self.parse_embedded_transcript(text_item)
             
             # Overall transcript analysis
-            vader_compound, vader_pos, vader_neg, textblob_pol = self.get_sentiment_scores(text)
+            vader_compound, vader_pos, vader_neg, textblob_pol = self.get_sentiment_scores(text_item)
             nps_score = self.predict_nps(vader_compound, vader_pos, vader_neg)
-            themes = self.identify_coaching_themes(text)
+            themes = self.identify_coaching_themes(text_item)
             coaching_priority = self.calculate_coaching_priority(themes)
             
             # Get top themes with scores
@@ -616,7 +598,7 @@ class CallCenterAnalyzer:
                     customer_analysis.extend(speaker_analysis.get('satisfaction_indicators', []))
             
             # Overall quality from full transcript
-            quality = self.detect_conversation_quality(text)
+            quality = self.detect_conversation_quality(text_item)
             
             # Format themes for display
             themes_summary = {}
@@ -627,7 +609,7 @@ class CallCenterAnalyzer:
                 }
             
             return {
-                'transcript_text': text[:200] + '...' if len(text) > 200 else text,
+                'transcript_text': text_item[:200] + '...' if len(text_item) > 200 else text_item,
                 'total_turns': len(turns),
                 'agent_turns': len([t for t in turns if t['speaker'] == 'AGENT']),
                 'customer_turns': len([t for t in turns if t['speaker'] == 'CUSTOMER']),
@@ -645,41 +627,50 @@ class CallCenterAnalyzer:
                 'quality_score': quality['quality_score'],
                 'quality_indicators': str(quality['indicators']),
                 'conversation_duration': f"{turns[-1]['timestamp']}" if turns else 'N/A',
-                'data_source': data_source
+                'data_source': 'pure_parquet'
             }
         
-        # Process with optimized Parquet data
-        if parallel and len(df) > 100:
+        # Process with pure Parquet operations
+        if parallel and len(text_data) > 100:
             with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = {executor.submit(process_row_optimized, row): idx for idx, row in df.iterrows()}
+                futures = {executor.submit(process_text_item, text): idx for idx, text in enumerate(text_data)}
                 
                 progress_bar = st.progress(0)
                 for i, future in enumerate(as_completed(futures)):
-                    results.append(future.result())
+                    result = future.result()
+                    if result:
+                        results.append(result)
                     progress_bar.progress((i + 1) / len(futures))
         else:
             progress_bar = st.progress(0)
-            for i, (_, row) in enumerate(df.iterrows()):
-                results.append(process_row_optimized(row))
-                progress_bar.progress((i + 1) / len(df))
+            for i, text_item in enumerate(text_data):
+                result = process_text_item(text_item)
+                if result:
+                    results.append(result)
+                progress_bar.progress((i + 1) / len(text_data))
         
         # Create result DataFrame and cache it
         result_df = pd.DataFrame(results)
         st.session_state.processing_cache[cache_key] = result_df
         
-        st.success(f"✅ Processed {len(result_df)} records using {data_source}")
+        st.success(f"✅ Processed {len(result_df)} records using pure Parquet operations")
         return result_df
     
-    def generate_turn_analysis_from_parquet(self, text_col, parquet_df):
-        """Generate turn-by-turn analysis using Parquet data"""
-        st.info("🔄 Generating turn analysis from Parquet data")
+    def generate_turn_analysis_from_parquet(self, parquet_table, text_col):
+        """Generate turn-by-turn analysis using pure Parquet operations"""
+        st.info("🔄 Generating turn analysis from pure Parquet data")
+        
+        # Extract text data directly from Parquet
+        text_data = self.parquet_processor.get_column_data(parquet_table, text_col)
         
         turn_results = []
         progress_bar = st.progress(0)
         
-        for i, row in parquet_df.iterrows():
-            transcript_text = row[text_col]
-            turns = self.parse_embedded_transcript(transcript_text)
+        for i, text_item in enumerate(text_data):
+            if not text_item:
+                continue
+                
+            turns = self.parse_embedded_transcript(text_item)
             
             for turn in turns:
                 # Analyze each turn
@@ -705,10 +696,10 @@ class CallCenterAnalyzer:
                     'speaker_analysis': str(speaker_analysis.get('coaching_focus', [])) if speaker_analysis['speaker_type'] == 'agent' else str(speaker_analysis.get('satisfaction_indicators', []))
                 })
             
-            progress_bar.progress((i + 1) / len(parquet_df))
+            progress_bar.progress((i + 1) / len(text_data))
         
         turn_df = pd.DataFrame(turn_results)
-        st.success(f"✅ Generated turn analysis for {len(turn_df)} turns from Parquet data")
+        st.success(f"✅ Generated turn analysis for {len(turn_df)} turns from pure Parquet data")
         return turn_df
 
 def get_file_hash(uploaded_file):
@@ -723,10 +714,9 @@ def load_file_to_parquet(uploaded_file):
         file_hash = get_file_hash(uploaded_file)
         
         if (st.session_state.file_hash == file_hash and 
-            st.session_state.parquet_table is not None and 
-            st.session_state.parquet_dataframe is not None):
+            st.session_state.parquet_table is not None):
             st.info("📋 Using cached Parquet data")
-            return st.session_state.parquet_table, st.session_state.parquet_dataframe, st.session_state.compression_stats
+            return st.session_state.parquet_table, st.session_state.compression_stats
         
         filename = uploaded_file.name
         file_ext = filename.split('.')[-1].lower()
@@ -738,22 +728,22 @@ def load_file_to_parquet(uploaded_file):
                 df = pd.read_excel(uploaded_file)
             else:
                 st.error("Unsupported file format. Please upload CSV, XLS, or XLSX files.")
-                return None, None, {}
+                return None, {}
             
             st.success(f"📁 File loaded: {len(df)} rows, {len(df.columns)} columns")
             
             # Convert to Parquet with compression
-            parquet_manager = ParquetManager()
-            parquet_table, parquet_df, compression_stats = parquet_manager.convert_to_parquet(df, filename)
+            parquet_processor = ParquetProcessor()
+            parquet_table, compression_stats = parquet_processor.convert_to_parquet(df, filename)
             
             # Update session state
             st.session_state.file_hash = file_hash
             
-            return parquet_table, parquet_df, compression_stats
+            return parquet_table, compression_stats
     
     except Exception as e:
         st.error(f"Error loading file: {str(e)}")
-        return None, None, {}
+        return None, {}
 
 def create_parquet_export(results_df, turn_df=None):
     """Create Parquet export for download"""
@@ -782,12 +772,47 @@ def create_parquet_export(results_df, turn_df=None):
         st.error(f"Error creating Parquet export: {str(e)}")
         return None
 
+def filter_results_using_parquet(results_df, filter_theme, priority_filter):
+    """Filter results using optimized operations"""
+    display_df = results_df.copy()
+    
+    # Theme filter
+    if filter_theme != 'All':
+        display_df = display_df[display_df['top_coaching_theme'] == filter_theme]
+    
+    # Priority filter
+    if priority_filter != 'All':
+        if priority_filter == 'Critical (< -2)':
+            display_df = display_df[display_df['coaching_priority_score'] < -2]
+        elif priority_filter == 'Needs Improvement (< 0)':
+            display_df = display_df[display_df['coaching_priority_score'] < 0]
+        elif priority_filter == 'Good Performance (> 2)':
+            display_df = display_df[display_df['coaching_priority_score'] > 2]
+    
+    return display_df
+
+def filter_turns_using_parquet(turn_df, speaker_filter, turn_priority_filter):
+    """Filter turn analysis using optimized operations"""
+    filtered_turns = turn_df.copy()
+    
+    # Speaker filter
+    if speaker_filter != 'All':
+        filtered_turns = filtered_turns[filtered_turns['speaker'] == speaker_filter]
+    
+    # Priority filter  
+    if turn_priority_filter == 'Critical Turns (< -2)':
+        filtered_turns = filtered_turns[filtered_turns['coaching_priority'] < -2]
+    elif turn_priority_filter == 'Positive Turns (> 1)':
+        filtered_turns = filtered_turns[filtered_turns['coaching_priority'] > 1]
+    
+    return filtered_turns
+
 def main():
     # Initialize session state
     initialize_session_state()
     
     st.title("📞 Call Center Agent Coaching Analytics")
-    st.markdown("*Transform call transcripts into actionable coaching insights with Parquet optimization*")
+    st.markdown("*Transform call transcripts into actionable coaching insights with Pure Parquet Processing*")
     
     # Sidebar Configuration
     with st.sidebar:
@@ -796,7 +821,6 @@ def main():
         # Processing options
         st.subheader("Processing Options")
         parallel_processing = st.checkbox("Enable Parallel Processing", help="Faster processing for large datasets")
-        use_parquet_optimization = st.checkbox("Use Parquet Optimization", value=True, help="Use Parquet format for faster processing")
         
         # Session cache and Parquet stats
         st.subheader("📊 Performance Stats")
@@ -816,7 +840,6 @@ def main():
         if st.button("Clear All Cache", help="Clear all cached processing results and Parquet data"):
             st.session_state.processing_cache.clear()
             st.session_state.parquet_table = None
-            st.session_state.parquet_dataframe = None
             st.session_state.file_hash = None
             st.session_state.compression_stats = {}
             st.success("All cache cleared")
@@ -842,11 +865,10 @@ def main():
     if uploaded_file is not None:
         # Load file to Parquet
         if not st.session_state.file_uploaded or st.session_state.get('last_file') != uploaded_file.name:
-            parquet_table, parquet_df, compression_stats = load_file_to_parquet(uploaded_file)
+            parquet_table, compression_stats = load_file_to_parquet(uploaded_file)
             
-            if parquet_table is not None and parquet_df is not None:
+            if parquet_table is not None:
                 st.session_state.parquet_table = parquet_table
-                st.session_state.parquet_dataframe = parquet_df
                 st.session_state.compression_stats = compression_stats
                 st.session_state.file_uploaded = True
                 st.session_state.last_file = uploaded_file.name
@@ -854,14 +876,16 @@ def main():
                 st.stop()
         else:
             parquet_table = st.session_state.parquet_table
-            parquet_df = st.session_state.parquet_dataframe
         
         # Column selection from Parquet data
         st.subheader("🎯 Column Configuration")
         col1, col2 = st.columns(2)
         
+        # Get columns directly from Parquet table
+        parquet_processor = ParquetProcessor()
+        available_columns = parquet_processor.get_column_names(parquet_table)
+        
         with col1:
-            available_columns = parquet_df.columns.tolist()
             text_column = st.selectbox(
                 "Select Text/Transcript Column",
                 options=available_columns,
@@ -877,30 +901,30 @@ def main():
             )
         
         # Process button
-        if st.button("🚀 Start Parquet-Optimized Analysis", type="primary"):
-            analyzer = CallCenterAnalyzer(use_parquet=use_parquet_optimization)
+        if st.button("🚀 Start Pure Parquet Analysis", type="primary"):
+            analyzer = CallCenterAnalyzer()
             
-            with st.spinner("Processing transcripts using Parquet optimization..."):
+            with st.spinner("Processing transcripts using Pure Parquet operations..."):
                 start_time = time.time()
                 
-                # Main analysis using Parquet data
-                results_df = analyzer.process_transcript_from_parquet(
-                    text_column, 
-                    parquet_table=parquet_table if use_parquet_optimization else None,
-                    parquet_df=parquet_df,
+                # Main analysis using pure Parquet operations
+                results_df = analyzer.process_parquet_data(
+                    parquet_table, 
+                    text_column,
                     parallel=parallel_processing
                 )
                 
                 if results_df is not None:
-                    # Add additional columns from Parquet DataFrame
+                    # Add additional columns from Parquet table
                     for col in additional_columns:
-                        if col in parquet_df.columns:
-                            results_df[col] = parquet_df[col].reset_index(drop=True)
+                        if col in available_columns:
+                            col_data = parquet_processor.get_column_data(parquet_table, col)
+                            results_df[col] = col_data[:len(results_df)]
                     
                     processing_time = time.time() - start_time
                     
                     st.session_state.processed_data = results_df
-                    st.success(f"✅ Parquet-optimized analysis completed in {processing_time:.2f} seconds!")
+                    st.success(f"✅ Pure Parquet analysis completed in {processing_time:.2f} seconds!")
                 else:
                     st.error("Analysis failed. Please try again.")
         
@@ -911,7 +935,7 @@ def main():
             # Data source indicator
             if 'data_source' in results_df.columns:
                 data_source = results_df['data_source'].iloc[0]
-                if 'parquet' in data_source:
+                if 'pure_parquet' in data_source:
                     st.success(f"🚀 Results generated using {data_source}")
             
             # Summary metrics
@@ -996,21 +1020,8 @@ def main():
                     key="main_priority_filter"
                 )
             
-            # Apply filters with proper error handling
-            display_df = results_df.copy()
-            
-            # Theme filter
-            if filter_theme != 'All':
-                display_df = display_df[display_df['top_coaching_theme'] == filter_theme]
-            
-            # Priority filter
-            if priority_filter != 'All':
-                if priority_filter == 'Critical (< -2)':
-                    display_df = display_df[display_df['coaching_priority_score'] < -2]
-                elif priority_filter == 'Needs Improvement (< 0)':
-                    display_df = display_df[display_df['coaching_priority_score'] < 0]
-                elif priority_filter == 'Good Performance (> 2)':
-                    display_df = display_df[display_df['coaching_priority_score'] > 2]
+            # Apply filters using optimized operations
+            display_df = filter_results_using_parquet(results_df, filter_theme, priority_filter)
             
             # Apply column selection
             if show_columns:
@@ -1031,12 +1042,12 @@ def main():
             else:
                 st.warning("No data matches the selected filters. Please adjust your filter criteria.")
             
-            # Turn-by-turn analysis using Parquet
+            # Turn-by-turn analysis using pure Parquet
             st.subheader("🔄 Turn-by-Turn Conversation Analysis")
             
-            if st.button("Generate Turn-by-Turn Analysis from Parquet", type="secondary"):
-                analyzer = CallCenterAnalyzer(use_parquet=True)
-                turn_df = analyzer.generate_turn_analysis_from_parquet(text_column, parquet_df)
+            if st.button("Generate Turn-by-Turn Analysis from Pure Parquet", type="secondary"):
+                analyzer = CallCenterAnalyzer()
+                turn_df = analyzer.generate_turn_analysis_from_parquet(parquet_table, text_column)
                 
                 if turn_df is not None and len(turn_df) > 0:
                     st.session_state.turn_analysis = turn_df
@@ -1085,18 +1096,8 @@ def main():
                         key="turn_priority_filter"
                     )
                 
-                # Apply turn filters
-                filtered_turns = turn_df.copy()
-                
-                # Speaker filter
-                if speaker_filter != 'All':
-                    filtered_turns = filtered_turns[filtered_turns['speaker'] == speaker_filter]
-                
-                # Priority filter  
-                if turn_priority_filter == 'Critical Turns (< -2)':
-                    filtered_turns = filtered_turns[filtered_turns['coaching_priority'] < -2]
-                elif turn_priority_filter == 'Positive Turns (> 1)':
-                    filtered_turns = filtered_turns[filtered_turns['coaching_priority'] > 1]
+                # Apply turn filters using optimized operations
+                filtered_turns = filter_turns_using_parquet(turn_df, speaker_filter, turn_priority_filter)
                 
                 # Display results count
                 st.info(f"Showing {len(filtered_turns)} of {len(turn_df)} turns")
@@ -1161,19 +1162,20 @@ def main():
             ### Step-by-Step Guide:
             
             1. **Upload File**: Upload your call transcript file (CSV, Excel)
-            2. **Parquet Conversion**: File is automatically converted to optimized Parquet format
+            2. **Pure Parquet Conversion**: File is automatically converted to optimized Parquet format
             3. **Select Text Column**: Choose the column containing embedded transcript format
             4. **Choose Output Columns**: Select additional columns to include in analysis
-            5. **Run Analysis**: Click 'Start Parquet-Optimized Analysis' for maximum performance
+            5. **Run Analysis**: Click 'Start Pure Parquet Analysis' for maximum performance
             6. **Review Results**: Examine coaching themes, sentiment scores, and NPS predictions
-            7. **Turn Analysis**: Generate detailed turn-by-turn coaching insights from Parquet data
+            7. **Turn Analysis**: Generate detailed turn-by-turn coaching insights from pure Parquet data
             8. **Export Data**: Download results in CSV, Excel, or optimized Parquet format
             
-            ### Parquet Optimization Benefits:
-            - **🚀 Faster Processing**: Columnar storage for optimized analytics
-            - **🗜️ Data Compression**: Significant reduction in memory usage
-            - **⚡ Cache Performance**: Optimized caching with compressed data
-            - **📊 Scalability**: Better handling of large datasets
+            ### Pure Parquet Processing Benefits:
+            - **🚀 Zero DataFrame Conversion**: Direct Parquet table operations
+            - **🗜️ Maximum Compression**: Snappy compression with dictionary encoding
+            - **⚡ Optimized Caching**: Pure Parquet data in session state
+            - **📊 Extreme Scalability**: Handles massive datasets efficiently
+            - **💾 Memory Efficiency**: Minimal memory footprint during processing
             
             ### Embedded Format Support:
             - **Format**: `[HH:MM:SS SPEAKER]: dialogue text`
@@ -1185,7 +1187,7 @@ def main():
             - 📊 **NPS Prediction**: Estimates Net Promoter Score based on conversation sentiment
             - 🔄 **Turn-by-Turn Analysis**: Analyzes agent vs customer interactions separately
             - ⚡ **Parallel Processing**: Faster analysis for large datasets
-            - 💾 **Smart Caching**: Optimized performance with Parquet-based caching
+            - 💾 **Pure Parquet Caching**: Optimized performance with zero DataFrame conversion
             - 🗜️ **Snappy Compression**: Maximum compression with fast decompression
             - 🎪 **Coaching Priorities**: Weighted scoring system for coaching urgency
             """)

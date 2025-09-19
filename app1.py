@@ -88,7 +88,8 @@ class ArrowVectorizedEngine:
                 pq.write_table(
                     optimized_table,
                     parquet_buffer,
-                    compression='snappy',
+                    compression='zstd',
+                    compression_level=6, 
                     use_dictionary=True,
                     row_group_size=20000,
                     use_compliant_nested_type=True,
@@ -821,8 +822,9 @@ def create_optimized_parquet_export(results_df, turn_analysis_df=None):
         pq.write_table(
             results_table,
             results_buffer,
-            compression='snappy',
-            use_dictionary=True,
+            compression='zstd',
+            compression_level=6, 
+            use_dictionary=False,
             write_statistics=True,
             use_byte_stream_split=True,
             
@@ -840,10 +842,11 @@ def create_optimized_parquet_export(results_df, turn_analysis_df=None):
             pq.write_table(
                 turn_table,
                 turn_buffer,
-                compression='snappy',
-                use_dictionary=True,
+                compression='zstd',
+                compression_level=6,
+                use_dictionary=False,
                 write_statistics=True,
-                use_byte_stream_split=True,
+                use_byte_stream_split=False,
                 
             )
             turn_buffer.seek(0)

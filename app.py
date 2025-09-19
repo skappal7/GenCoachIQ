@@ -1,1243 +1,821 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import json
+from io import BytesIO
 import re
 from datetime import datetime
-import logging
-from typing import Dict, List, Optional
-import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+import time
 
-# NLP imports with fallbacks
-try:
-    from transformers import pipeline
-    TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    TRANSFORMERS_AVAILABLE = False
+# Lightweight NLP libraries
+from textblob import TextBlob
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
+# File format support
 try:
-    from textblob import TextBlob
-    TEXTBLOB_AVAILABLE = True
-except ImportError:
-    TEXTBLOB_AVAILABLE = False
-
-try:
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    VADER_AVAILABLE = True
-except ImportError:
-    VADER_AVAILABLE = False
-
-try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.cluster import KMeans
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
-
-try:
-    import plotly.express as px
-    import plotly.graph_objects as go
-    PLOTLY_AVAILABLE = True
-except ImportError:
-    PLOTLY_AVAILABLE = False
-
-try:
-    import pyarrow as pa
     import pyarrow.parquet as pq
-    PYARROW_AVAILABLE = True
+    import pyarrow as pa
 except ImportError:
-    PYARROW_AVAILABLE = False
+    st.error("Please install pyarrow: pip install pyarrow")
 
-try:
-    import openpyxl
-    OPENPYXL_AVAILABLE = True
-except ImportError:
-    OPENPYXL_AVAILABLE = False
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Page configuration
+# Configure page
 st.set_page_config(
     page_title="GenCoachingIQ",
-    page_icon="🧠",
+    page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
-st.markdown("""
-<style>
-    .main-header {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 2rem;
-        border-radius: 15px;
-        color: white;
-        text-align: center;
-        margin-bottom: 2rem;
-        box-shadow: 0 8px 32px rgba(0,0,0,0.1);
-    }
-    
-    .main-header h1 {
-        font-size: 2.5rem;
-        margin-bottom: 0.5rem;
-        text-shadow: 0 2px 4px rgba(0,0,0,0.3);
-    }
-    
-    .metric-container {
-        background: linear-gradient(145deg, #ffffff 0%, #f8f9fa 100%);
-        padding: 1.5rem;
-        border-radius: 12px;
-        box-shadow: 0 4px 16px rgba(0,0,0,0.1);
-        border-left: 4px solid #667eea;
-        text-align: center;
-        margin-bottom: 1rem;
-    }
-    
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 4px;
-        background-color: #f8f9fa;
-        padding: 4px;
-        border-radius: 12px;
-    }
-    
-    .stTabs [data-baseweb="tab"] {
-        height: 60px;
-        padding: 0 24px;
-        background-color: transparent;
-        border-radius: 8px;
-        color: #6c757d;
-        font-weight: 500;
-    }
-    
-    .stTabs [aria-selected="true"] {
-        background-color: #667eea;
-        color: white;
-        box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
-    }
-</style>
-""", unsafe_allow_html=True)
+# Initialize session state
+if 'processed_data' not in st.session_state:
+    st.session_state.processed_data = None
+if 'turn_analysis' not in st.session_state:
+    st.session_state.turn_analysis = None
+if 'file_uploaded' not in st.session_state:
+    st.session_state.file_uploaded = False
 
-class ConversationAnalyzer:
-    """Optimized conversation analysis engine with multiple sentiment analysis options"""
-    
-    def __init__(self, config: Optional[Dict] = None, sentiment_method: str = "vader"):
-        self.config = config or self.get_default_config()
-        self.sentiment_method = sentiment_method
-        self.sentiment_analyzer = None
-        self.vader_analyzer = None
-        self._initialize_models()
-    
-    @staticmethod
-    def get_default_config() -> Dict:
-        return {
-            "sentiment_threshold": 0.5,
-            "nps_weights": {"positive": 0.4, "neutral": 0.3, "negative": 0.3},
-            "compliance_keywords": [
-                "terms and conditions", "privacy policy", "data protection",
-                "opt-out", "consent", "agreement", "policy", "compliance"
+class CallCenterAnalyzer:
+    def __init__(self):
+        self.vader = SentimentIntensityAnalyzer()
+        self.coaching_themes = {
+            # 1. Empathy & Emotional Intelligence
+            "empathy": [
+                "I understand", "I completely understand", "I do understand", "I hear you",
+                "I see how you feel", "I see where you're coming from", "I realize this is frustrating",
+                "I can imagine", "I know this must be tough", "I'm sorry", "I apologize",
+                "I truly empathize", "thank you for your patience", "thank you for waiting",
+                "your concern is valid", "I totally get it", "I know how you feel",
+                "sorry to hear that", "I get your frustration", "I appreciate you sharing this",
+                "must be difficult", "I respect your concern", "I'm here to help",
+                "I hear the frustration in your voice", "I can sense this has been upsetting",
+                "it sounds like this caused you trouble", "I'll do everything I can"
             ],
-            "behavior_themes": [
-                "empathy", "professionalism", "problem solving", 
-                "active listening", "rapport building", "solution oriented"
+
+            # 2. Professionalism & Courtesy
+            "professionalism": [
+                "thank you for calling", "good morning", "good afternoon", "good evening",
+                "it's my pleasure", "I'll be happy to help", "thank you for reaching out",
+                "thank you for your time", "I appreciate your time", "it's been a pleasure",
+                "with respect", "I assure you", "I value your feedback", "thank you for choosing us",
+                "allow me to assist", "thanks for your cooperation", "thanks for staying on the line",
+                "I appreciate your understanding", "thank you for bearing with me",
+                "I appreciate your patience"
+            ],
+
+            # 3. Problem Solving & Resolution
+            "problem_solving": [
+                "let me check this for you", "let me look into this", "I will fix this",
+                "I'll work on resolving this", "we'll sort this out", "let's troubleshoot together",
+                "let me walk you through", "next steps will be", "I'll escalate this for resolution",
+                "I'll provide a workaround", "we can try this option", "here's a solution",
+                "I will investigate further", "I will resolve this", "I'll take corrective action",
+                "let's address this issue", "let me confirm once more", "this should fix it",
+                "the root cause appears to be", "we'll ensure this won't happen again",
+                "rest assured", "let me double-check that", "I'll send this to our specialist",
+                "I'll fast-track this to our tech team"
+            ],
+
+            # 4. Escalation Triggers (Customer Rants)
+            "escalation_triggers": [
+                "I want to speak to your supervisor", "let me talk to your manager",
+                "this is unacceptable", "this is ridiculous", "you people are useless",
+                "I've called 5 times already", "I'm sick of this", "you guys messed up",
+                "I don't want excuses", "just fix it", "cancel my account", "I'm done with your service",
+                "I'll take my business elsewhere", "I'll post a bad review", "I'm wasting my time",
+                "you never listen", "nobody helps me here", "why is this so difficult",
+                "I don't believe you", "you're not helping me"
+            ],
+
+            # 5. Active Listening
+            "listening": [
+                "let me repeat that back", "so what you're saying is", "to confirm your point",
+                "just to clarify", "if I understand correctly", "I heard you say",
+                "I got that", "I see what you mean", "noted", "please continue",
+                "go ahead", "tell me more about that", "let me make sure I understood",
+                "correct me if I'm wrong", "I'm listening carefully", "thanks for sharing that",
+                "so to summarize your concern", "let me restate it to be sure",
+                "to check my understanding", "just to make sure I captured that correctly"
+            ],
+
+            # 6. Polite Agent Phrases
+            "polite_agent": [
+                "please", "may I ask", "could you kindly", "if you don't mind",
+                "thank you very much", "I'd be glad to assist", "allow me a moment",
+                "thanks for waiting", "thank you for clarifying", "please hold while I check",
+                "thanks for your cooperation", "thanks for your patience",
+                "may I confirm", "if that's okay with you", "let me check that for you"
+            ],
+
+            # 7. Impolite Agent Phrases (coaching negatives)
+            "impolite_agent": [
+                "that's not my problem", "I can't help you with that", "that's impossible",
+                "you'll have to deal with it", "I already told you", "you're not listening",
+                "that's just the way it is", "there's nothing I can do", "stop interrupting me",
+                "you should have read the policy", "you must have done it wrong",
+                "we can't do anything about that", "I don't have time for this",
+                "that's not my department", "you need to figure it out"
+            ],
+
+            # 8. Closing & Wrap-up
+            "closing": [
+                "is there anything else I can help you with", "thank you for your time today",
+                "thank you for calling", "I appreciate your patience",
+                "your issue has been resolved", "let me summarize",
+                "to recap", "to confirm the resolution", "please reach out again if needed",
+                "I'm glad I could help", "thank you once again", "we appreciate your business",
+                "it's been my pleasure assisting you", "enjoy your day", "take care",
+                "closing the loop", "all set now", "your concern is addressed",
+                "we look forward to serving you again"
+            ],
+
+            # 9. Urgency & Escalation
+            "urgency": [
+                "I'll prioritize this", "this will be resolved urgently", "I'll escalate immediately",
+                "we'll handle this right away", "this is high priority", "critical matter",
+                "this needs immediate attention", "I'll fast-track this", "we'll expedite the process",
+                "as soon as possible", "I'll make this a top priority", "we'll resolve this quickly",
+                "urgent escalation required", "emergency handling", "let's address this without delay"
+            ],
+
+            # 10. Customer Colloquialisms
+            "customer_colloquialisms": [
+                "you guys messed up", "why is this so hard", "you never help me",
+                "every time I call", "same old story", "I'm fed up", "this always happens",
+                "I'm not happy with this", "don't waste my time", "you people always say that",
+                "I already explained this", "why can't you fix it", "this is taking forever",
+                "it's not rocket science", "how hard can it be", "I'm losing my patience",
+                "you're just reading a script", "talking to a wall"
+            ],
+
+            # 11. Domain-Specific Keywords
+            "domain_specific": [
+                # Banking/Insurance
+                "account balance", "policy number", "premium due", "loan repayment", "mortgage",
+                "installment", "interest rate", "credit card limit", "insurance claim", "underwriting",
+                "KYC process", "coverage details", "deductible", "co-pay", "payout", "settlement",
+                "investment maturity", "fixed deposit", "account closure",
+                # Retail/E-commerce
+                "order ID", "shipment tracking", "refund request", "return policy", "replacement order",
+                "discount coupon", "promo code", "delivery date", "out of stock", "loyalty points",
+                "cart checkout", "payment failure", "invoice copy", "exchange request",
+                # Healthcare
+                "doctor appointment", "prescription refill", "medical records", "insurance coverage",
+                "treatment plan", "consultation", "diagnosis", "lab results", "pharmacy",
+                "claim rejection", "prior authorization", "health benefits",
+                # Travel
+                "flight booking", "ticket cancellation", "check-in", "boarding pass", "reservation number",
+                "baggage allowance", "seat upgrade", "travel insurance", "itinerary", "visa application",
+                "hotel reservation", "passport details", "flight delay", "lost baggage"
+            ],
+            
+            # 12. Customer Satisfaction Indicators (Positive)
+            "customer_satisfaction": [
+                "thank you so much", "you've been very helpful", "I appreciate your help",
+                "that was exactly what I needed", "perfect", "excellent service", "great job",
+                "you solved my problem", "I'm satisfied", "that's much better", "wonderful",
+                "you're amazing", "I'm impressed", "outstanding support", "quick resolution",
+                "you made this easy", "fantastic", "couldn't ask for better service"
+            ],
+            
+            # 13. Customer Dissatisfaction Indicators (Negative)
+            "customer_dissatisfaction": [
+                "this is terrible", "worst service ever", "I'm not satisfied", "this doesn't help",
+                "you're wasting my time", "I'm still confused", "this makes no sense",
+                "you didn't fix anything", "I'm more frustrated now", "this is getting worse",
+                "I regret calling", "you made it worse", "I'm disappointed", "useless advice",
+                "I want my money back", "I'm canceling everything", "I'll never use this service again"
+            ],
+            
+            # 14. Agent Knowledge Gaps (coaching opportunities)
+            "knowledge_gaps": [
+                "I don't know", "I'm not sure", "let me find out", "I'll have to check",
+                "that's not my area", "I'm not familiar with that", "I'll need to ask someone",
+                "I don't have that information", "I'll get back to you", "let me research that",
+                "I'm not trained on that", "I'll transfer you", "that's above my level",
+                "I don't have access to that", "I'm still learning about that"
+            ],
+            
+            # 15. Customer Effort Indicators (high effort = bad experience)
+            "customer_effort": [
+                "I've been transferred 3 times", "I've been on hold forever", "I keep repeating myself",
+                "I already told the other person", "why do I have to explain again", "this is my fifth call",
+                "I've been calling all day", "no one can help me", "I keep getting bounced around",
+                "I've tried everything", "this is taking too long", "I've wasted hours on this",
+                "why is this so complicated", "I shouldn't have to do this much work"
             ]
         }
-    
-    def _initialize_models(self):
-        """Initialize models based on selected sentiment method"""
-        if self.sentiment_method == "transformers" and TRANSFORMERS_AVAILABLE:
-            try:
-                self.sentiment_analyzer = pipeline(
-                    "sentiment-analysis",
-                    model="cardiffnlp/twitter-roberta-base-sentiment-latest",
-                    return_all_scores=True,
-                    device=0 if self._has_gpu() else -1,
-                    batch_size=16
-                )
-                logger.info("Transformer sentiment analyzer initialized")
-            except Exception as e:
-                logger.error(f"Failed to initialize transformer model: {e}")
-                self.sentiment_analyzer = None
         
-        elif self.sentiment_method == "vader" and VADER_AVAILABLE:
-            try:
-                self.vader_analyzer = SentimentIntensityAnalyzer()
-                logger.info("VADER sentiment analyzer initialized")
-            except Exception as e:
-                logger.error(f"Failed to initialize VADER: {e}")
-                self.vader_analyzer = None
+        # Theme scoring weights based on coaching importance
+        self.theme_weights = {
+            "impolite_agent": -3,  # Most critical negative
+            "knowledge_gaps": -2,
+            "escalation_triggers": -2,
+            "customer_dissatisfaction": -1,
+            "customer_effort": -1,
+            "empathy": 2,  # Most important positive
+            "problem_solving": 2,
+            "professionalism": 1,
+            "listening": 1,
+            "polite_agent": 1,
+            "customer_satisfaction": 1,
+            "closing": 1,
+            "urgency": 0.5,
+            "customer_colloquialisms": 0,
+            "domain_specific": 0
+        }
     
-    def _has_gpu(self) -> bool:
-        try:
-            import torch
-            return torch.cuda.is_available()
-        except:
-            return False
-    
-    def analyze_sentiment_batch(self, texts: List[str]) -> List[Dict[str, float]]:
-        """Analyze sentiment using selected method"""
-        if not texts:
-            return []
+    @lru_cache(maxsize=1000)
+    def get_sentiment_scores(self, text):
+        """Cached sentiment analysis"""
+        if not text or pd.isna(text):
+            return 0.0, 0.0, 0.0, 0.0
         
-        # Use selected sentiment analysis method
-        if self.sentiment_method == "vader" and self.vader_analyzer:
-            return self._analyze_vader_batch(texts)
-        elif self.sentiment_method == "textblob" and TEXTBLOB_AVAILABLE:
-            return self._analyze_textblob_batch(texts)
-        elif self.sentiment_method == "transformers" and self.sentiment_analyzer:
-            return self._analyze_transformers_batch(texts)
+        # VADER sentiment
+        vader_scores = self.vader.polarity_scores(str(text))
+        
+        # TextBlob sentiment
+        blob = TextBlob(str(text))
+        textblob_polarity = blob.sentiment.polarity
+        
+        return (vader_scores['compound'], vader_scores['pos'], 
+                vader_scores['neg'], textblob_polarity)
+    
+    def predict_nps(self, sentiment_compound, sentiment_positive, sentiment_negative):
+        """Predict NPS based on sentiment scores"""
+        # Weighted scoring for NPS prediction
+        if sentiment_compound >= 0.5:
+            return np.random.randint(9, 11)  # Promoters
+        elif sentiment_compound >= 0.1:
+            return np.random.randint(7, 9)   # Passives
         else:
-            # Fallback to keyword analysis
-            return [self._keyword_sentiment_analysis(text) for text in texts]
+            return np.random.randint(0, 7)   # Detractors
     
-    def _analyze_vader_batch(self, texts: List[str]) -> List[Dict[str, float]]:
-        """VADER sentiment analysis - very fast"""
-        results = []
+    def identify_coaching_themes(self, text):
+        """Enhanced coaching theme identification with context awareness"""
+        if not text or pd.isna(text):
+            return {}
         
-        for text in texts:
-            if not text or len(text.strip()) == 0:
-                results.append({'positive': 0.33, 'neutral': 0.34, 'negative': 0.33})
-                continue
+        text_lower = str(text).lower()
+        themes_found = {}
+        
+        # Advanced phrase matching with context
+        for theme, phrases in self.coaching_themes.items():
+            theme_score = 0
+            matched_phrases = []
             
-            try:
-                scores = self.vader_analyzer.polarity_scores(text)
+            for phrase in phrases:
+                # Exact phrase matching
+                if phrase.lower() in text_lower:
+                    theme_score += 1
+                    matched_phrases.append(phrase)
                 
-                # VADER returns: pos, neu, neg, compound
-                pos = max(0, scores['pos'])
-                neu = max(0, scores['neu'])
-                neg = max(0, scores['neg'])
-                
-                total = pos + neu + neg
-                if total > 0:
-                    results.append({
-                        'positive': pos / total,
-                        'neutral': neu / total,
-                        'negative': neg / total
-                    })
-                else:
-                    results.append({'positive': 0.33, 'neutral': 0.34, 'negative': 0.33})
-                    
-            except Exception as e:
-                logger.debug(f"VADER analysis failed for text: {e}")
-                results.append({'positive': 0.33, 'neutral': 0.34, 'negative': 0.33})
+                # Partial matching for key phrases (more flexible)
+                phrase_words = phrase.lower().split()
+                if len(phrase_words) > 1:
+                    # Check if majority of words from phrase are present
+                    word_matches = sum(1 for word in phrase_words if word in text_lower)
+                    if word_matches >= len(phrase_words) * 0.7:  # 70% word match threshold
+                        theme_score += 0.5
+            
+            if theme_score > 0:
+                themes_found[theme] = {
+                    'score': theme_score,
+                    'matched_phrases': matched_phrases[:5],  # Top 5 matches
+                    'weight': self.theme_weights.get(theme, 0)
+                }
         
-        return results
+        return themes_found
     
-    def _analyze_textblob_batch(self, texts: List[str]) -> List[Dict[str, float]]:
-        """TextBlob sentiment analysis - fast"""
-        results = []
+    def calculate_coaching_priority(self, themes_dict):
+        """Calculate coaching priority based on theme weights"""
+        if not themes_dict:
+            return 0
         
-        for text in texts:
-            if not text or len(text.strip()) == 0:
-                results.append({'positive': 0.33, 'neutral': 0.34, 'negative': 0.33})
-                continue
-            
-            try:
-                blob = TextBlob(text)
-                polarity = blob.sentiment.polarity
-                
-                if polarity > 0.1:
-                    results.append({'positive': 0.7, 'neutral': 0.2, 'negative': 0.1})
-                elif polarity < -0.1:
-                    results.append({'positive': 0.1, 'neutral': 0.2, 'negative': 0.7})
-                else:
-                    results.append({'positive': 0.3, 'neutral': 0.4, 'negative': 0.3})
-                    
-            except Exception as e:
-                logger.debug(f"TextBlob analysis failed: {e}")
-                results.append({'positive': 0.33, 'neutral': 0.34, 'negative': 0.33})
+        total_weighted_score = 0
+        for theme, details in themes_dict.items():
+            score = details.get('score', 0)
+            weight = details.get('weight', 0)
+            total_weighted_score += score * weight
         
-        return results
+        return total_weighted_score
     
-    def _analyze_transformers_batch(self, texts: List[str]) -> List[Dict[str, float]]:
-        """Transformer sentiment analysis - most accurate but slowest"""
-        valid_texts = [text for text in texts if text and len(text.strip()) > 0]
+    def detect_conversation_quality(self, text, speaker='Unknown'):
+        """Detect conversation quality indicators"""
+        if not text or pd.isna(text):
+            return {'quality_score': 0, 'indicators': []}
         
-        if not valid_texts:
-            return [{'positive': 0.33, 'neutral': 0.34, 'negative': 0.33}] * len(texts)
+        text_lower = str(text).lower()
+        quality_indicators = []
+        quality_score = 0
         
-        try:
-            batch_results = self.sentiment_analyzer(valid_texts)
-            results = []
-            valid_idx = 0
-            
-            for text in texts:
-                if not text or len(text.strip()) == 0:
-                    results.append({'positive': 0.33, 'neutral': 0.34, 'negative': 0.33})
-                else:
-                    result = batch_results[valid_idx]
-                    sentiment_scores = {'positive': 0.0, 'neutral': 0.0, 'negative': 0.0}
-                    
-                    for item in result:
-                        label = item['label'].lower()
-                        score = float(item['score'])
-                        
-                        if 'pos' in label:
-                            sentiment_scores['positive'] = score
-                        elif 'neg' in label:
-                            sentiment_scores['negative'] = score
-                        else:
-                            sentiment_scores['neutral'] = score
-                    
-                    total = sum(sentiment_scores.values())
-                    if total > 0:
-                        sentiment_scores = {k: v/total for k, v in sentiment_scores.items()}
-                    
-                    results.append(sentiment_scores)
-                    valid_idx += 1
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Transformer batch analysis failed: {e}")
-            return [self._keyword_sentiment_analysis(text) for text in texts]
-    
-    def _keyword_sentiment_analysis(self, text: str) -> Dict[str, float]:
-        positive_words = ['good', 'great', 'excellent', 'satisfied', 'happy', 'pleased', 'thank', 'thanks', 'helpful', 'solved']
-        negative_words = ['bad', 'terrible', 'awful', 'angry', 'frustrated', 'disappointed', 'complaint', 'problem', 'issue', 'wrong']
-        
-        text_lower = text.lower()
-        pos_count = sum(1 for word in positive_words if word in text_lower)
-        neg_count = sum(1 for word in negative_words if word in text_lower)
-        
-        if pos_count > neg_count:
-            return {'positive': 0.6, 'neutral': 0.3, 'negative': 0.1}
-        elif neg_count > pos_count:
-            return {'positive': 0.1, 'neutral': 0.3, 'negative': 0.6}
-        else:
-            return {'positive': 0.33, 'neutral': 0.34, 'negative': 0.33}
-    
-    def extract_themes_batch(self, text_lists: List[List[str]], n_themes: int = 5) -> List[List[str]]:
-        """Extract themes for multiple conversations at once"""
-        if not text_lists:
-            return []
-        
-        results = []
-        
-        if SKLEARN_AVAILABLE:
-            for texts in text_lists:
-                if not texts:
-                    results.append([])
-                    continue
-                
-                meaningful_texts = [text for text in texts if text and len(text.split()) > 3]
-                if not meaningful_texts:
-                    results.append(['general conversation'])
-                    continue
-                
-                try:
-                    themes = self._advanced_theme_extraction(meaningful_texts, n_themes)
-                    results.append(themes)
-                except Exception as e:
-                    logger.debug(f"Theme extraction failed: {e}")
-                    results.append(self._simple_theme_extraction(meaningful_texts, n_themes))
-        else:
-            for texts in text_lists:
-                if texts:
-                    meaningful_texts = [text for text in texts if text and len(text.split()) > 3]
-                    if meaningful_texts:
-                        results.append(self._simple_theme_extraction(meaningful_texts, n_themes))
-                    else:
-                        results.append(['general conversation'])
-                else:
-                    results.append([])
-        
-        return results
-    
-    def _advanced_theme_extraction(self, texts: List[str], n_themes: int) -> List[str]:
-        try:
-            vectorizer = TfidfVectorizer(
-                max_features=500,
-                stop_words='english',
-                ngram_range=(1, 2),
-                min_df=1,
-                max_df=0.8
-            )
-            
-            tfidf_matrix = vectorizer.fit_transform(texts)
-            
-            n_clusters = min(n_themes, len(texts), 5)
-            if n_clusters < 2:
-                feature_names = vectorizer.get_feature_names_out()
-                mean_scores = np.mean(tfidf_matrix.toarray(), axis=0)
-                top_indices = mean_scores.argsort()[-n_themes:][::-1]
-                return [feature_names[idx] for idx in top_indices]
-            
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=5, max_iter=100)
-            kmeans.fit(tfidf_matrix)
-            
-            feature_names = vectorizer.get_feature_names_out()
-            themes = []
-            
-            for i in range(n_clusters):
-                cluster_center = kmeans.cluster_centers_[i]
-                top_indices = cluster_center.argsort()[-3:][::-1]
-                theme_words = [feature_names[idx] for idx in top_indices]
-                themes.append(' '.join(theme_words))
-            
-            return themes[:n_themes]
-            
-        except Exception as e:
-            logger.error(f"Advanced theme extraction failed: {e}")
-            return self._simple_theme_extraction(texts, n_themes)
-    
-    def _simple_theme_extraction(self, texts: List[str], n_themes: int) -> List[str]:
-        all_text = ' '.join(texts).lower()
-        words = re.findall(r'\b[a-zA-Z]{4,}\b', all_text)
-        
-        stop_words = {'that', 'with', 'have', 'this', 'will', 'your', 'from', 'they', 'know', 'want', 'been', 'good', 'much', 'some', 'time', 'very', 'when', 'come', 'here', 'just', 'like', 'long', 'make', 'many', 'over', 'such', 'take', 'than', 'them', 'well', 'were', 'what', 'where', 'would'}
-        
-        filtered_words = [word for word in words if word not in stop_words and len(word) > 4]
-        
-        word_freq = {}
-        for word in filtered_words:
-            word_freq[word] = word_freq.get(word, 0) + 1
-        
-        top_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:n_themes]
-        return [word for word, freq in top_words] if top_words else ['general conversation']
-    
-    def calculate_nps_score(self, sentiment_scores: Dict[str, float]) -> float:
-        weights = self.config["nps_weights"]
-        
-        nps_score = (
-            sentiment_scores.get('positive', 0) * weights['positive'] * 100 +
-            sentiment_scores.get('neutral', 0) * weights['neutral'] * 50 -
-            sentiment_scores.get('negative', 0) * weights['negative'] * 25
-        )
-        
-        return max(0.0, min(100.0, float(nps_score)))
-    
-    def check_compliance_batch(self, texts: List[str]) -> List[Dict[str, any]]:
-        """Check compliance for multiple texts at once"""
-        keywords = self.config['compliance_keywords']
-        if not keywords:
-            return [{'score': 100.0, 'found_keywords': [], 'missing_keywords': []} for _ in texts]
-        
-        results = []
-        
-        for text in texts:
-            if not text:
-                results.append({'score': 100.0, 'found_keywords': [], 'missing_keywords': keywords})
-                continue
-            
-            text_lower = text.lower()
-            found_keywords = [kw for kw in keywords if kw.lower() in text_lower]
-            
-            compliance_score = (len(found_keywords) / len(keywords)) * 100 if keywords else 100.0
-            missing_keywords = [kw for kw in keywords if kw not in found_keywords]
-            
-            results.append({
-                'score': float(compliance_score),
-                'found_keywords': found_keywords,
-                'missing_keywords': missing_keywords
-            })
-        
-        return results
-    
-    def calculate_coaching_priority(self, sentiment_scores: Dict[str, float], 
-                                  compliance_result: Dict[str, any], 
-                                  turn_count: int = 0) -> float:
-        priority_factors = []
-        
-        negative_sentiment = sentiment_scores.get('negative', 0)
-        priority_factors.append(negative_sentiment * 8)
-        
-        compliance_gap = (100 - compliance_result['score']) / 10
-        priority_factors.append(compliance_gap)
-        
-        if turn_count > 0:
-            if turn_count < 3:
-                priority_factors.append(3)
-            elif turn_count > 20:
-                priority_factors.append(2)
-        
-        priority_score = sum(priority_factors) / len(priority_factors) if priority_factors else 5.0
-        return float(max(1.0, min(10.0, priority_score)))
-
-class TranscriptProcessor:
-    def __init__(self, analyzer: ConversationAnalyzer):
-        self.analyzer = analyzer
-    
-    def parse_timestamped_transcript(self, transcript: str) -> Dict[str, any]:
-        if not transcript or len(transcript.strip()) == 0:
-            return self._empty_parse_result(transcript)
-        
-        patterns = [
-            r'\[(\d{1,2}:\d{2}:\d{2})\s+(AGENT|CUSTOMER|REPRESENTATIVE|CALLER)\]:\s*(.*?)(?=\[|$)',
-            r'\[(\d{1,2}:\d{2}:\d{2})\]\s+(AGENT|CUSTOMER|REPRESENTATIVE|CALLER):\s*(.*?)(?=\[|$)',
-            r'(\d{1,2}:\d{2}:\d{2})\s+(AGENT|CUSTOMER|REPRESENTATIVE|CALLER):\s*(.*?)(?=\d{1,2}:\d{2}:\d{2}|$)'
+        # Positive indicators
+        positive_phrases = [
+            'thank you', 'please', 'I apologize', 'I understand',
+            'let me help', 'I appreciate', 'my pleasure'
         ]
         
-        conversation_turns = []
-        agent_texts = []
-        customer_texts = []
+        # Negative indicators
+        negative_phrases = [
+            'that\'s not my problem', 'impossible', 'can\'t help',
+            'not my department', 'you should have', 'I don\'t know'
+        ]
         
-        for pattern in patterns:
-            matches = re.findall(pattern, transcript, re.IGNORECASE | re.DOTALL)
-            if matches:
-                for timestamp_str, speaker, content in matches:
-                    try:
-                        time_parts = timestamp_str.split(':')
-                        total_seconds = int(time_parts[0]) * 3600 + int(time_parts[1]) * 60 + int(time_parts[2])
-                        
-                        speaker_normalized = 'AGENT' if speaker.upper() in ['AGENT', 'REPRESENTATIVE'] else 'CUSTOMER'
-                        content_clean = content.strip()
-                        
-                        if not content_clean:
-                            continue
-                        
-                        turn_data = {
-                            'timestamp': timestamp_str,
-                            'seconds': total_seconds,
-                            'speaker': speaker_normalized,
-                            'content': content_clean,
-                            'word_count': len(content_clean.split())
-                        }
-                        conversation_turns.append(turn_data)
-                        
-                        if speaker_normalized == 'AGENT':
-                            agent_texts.append(content_clean)
-                        else:
-                            customer_texts.append(content_clean)
-                    except (ValueError, IndexError):
-                        continue
-                break
+        # Count positive indicators
+        for phrase in positive_phrases:
+            if phrase in text_lower:
+                quality_score += 1
+                quality_indicators.append(f"Positive: {phrase}")
         
-        if not conversation_turns:
-            return self._empty_parse_result(transcript)
-        
-        conversation_turns.sort(key=lambda x: x['seconds'])
-        
-        total_duration = 0
-        if len(conversation_turns) > 1:
-            total_duration = conversation_turns[-1]['seconds'] - conversation_turns[0]['seconds']
+        # Count negative indicators
+        for phrase in negative_phrases:
+            if phrase in text_lower:
+                quality_score -= 2
+                quality_indicators.append(f"Negative: {phrase}")
         
         return {
-            'turns': conversation_turns,
-            'agent_text': ' '.join(agent_texts),
-            'customer_text': ' '.join(customer_texts),
-            'total_duration': max(0, total_duration),
-            'turn_count': len(conversation_turns),
-            'has_timestamps': True,
-            'agent_name': 'Agent',
-            'customer_name': 'Customer'
+            'quality_score': quality_score,
+            'indicators': quality_indicators
         }
     
-    def _empty_parse_result(self, transcript: str) -> Dict[str, any]:
-        return {
-            'turns': [],
-            'agent_text': transcript or '',
-            'customer_text': '',
-            'total_duration': 0,
-            'turn_count': 0,
-            'has_timestamps': False,
-            'agent_name': 'Unknown',
-            'customer_name': 'Unknown'
-        }
-    
-    def analyze_conversation_flow(self, parsed_transcript: Dict) -> Dict[str, any]:
-        if not parsed_transcript.get('has_timestamps'):
-            agent_text = parsed_transcript.get('agent_text', '')
-            customer_text = parsed_transcript.get('customer_text', '')
+    def analyze_customer_agent_interaction(self, text, speaker):
+        """Specialized analysis based on speaker type"""
+        themes = self.identify_coaching_themes(text)
+        quality = self.detect_conversation_quality(text, speaker)
+        
+        if speaker and speaker.lower() in ['agent', 'rep', 'representative']:
+            # Agent-specific analysis
+            coaching_focus = []
+            
+            # Check for impolite language
+            if 'impolite_agent' in themes:
+                coaching_focus.append('CRITICAL: Impolite language detected')
+            
+            # Check for knowledge gaps
+            if 'knowledge_gaps' in themes:
+                coaching_focus.append('Training needed: Knowledge gaps identified')
+            
+            # Check for good behaviors
+            if 'empathy' in themes:
+                coaching_focus.append('Strength: Empathy demonstrated')
+            
+            if 'problem_solving' in themes:
+                coaching_focus.append('Strength: Problem-solving approach')
             
             return {
-                'agent_sentiment_timeline': [],
-                'customer_sentiment_timeline': [],
-                'agent_themes': self.analyzer.extract_themes_batch([[agent_text]], 3)[0] if agent_text else [],
-                'customer_themes': self.analyzer.extract_themes_batch([[customer_text]], 3)[0] if customer_text else []
+                'speaker_type': 'agent',
+                'coaching_focus': coaching_focus,
+                'themes': themes,
+                'quality': quality
             }
         
-        turns = parsed_transcript['turns']
-        agent_timeline = []
-        customer_timeline = []
-        agent_texts = []
-        customer_texts = []
-        
-        for turn in turns:
-            content = turn['content']
-            if not content or len(content.strip()) < 3:
-                continue
+        elif speaker and speaker.lower() in ['customer', 'client', 'caller']:
+            # Customer-specific analysis
+            satisfaction_indicators = []
             
-            sentiment = self.analyzer.analyze_sentiment_batch([content])[0]
-            primary_sentiment = max(sentiment, key=sentiment.get)
+            # Check satisfaction levels
+            if 'customer_satisfaction' in themes:
+                satisfaction_indicators.append('Positive: Customer satisfaction expressed')
             
-            timeline_entry = {
-                'timestamp': turn['timestamp'],
-                'seconds': turn['seconds'],
-                'sentiment': primary_sentiment,
-                'sentiment_score': float(sentiment[primary_sentiment])
+            if 'customer_dissatisfaction' in themes:
+                satisfaction_indicators.append('Alert: Customer dissatisfaction detected')
+            
+            if 'escalation_triggers' in themes:
+                satisfaction_indicators.append('WARNING: Escalation triggers present')
+            
+            if 'customer_effort' in themes:
+                satisfaction_indicators.append('Concern: High customer effort indicated')
+            
+            return {
+                'speaker_type': 'customer',
+                'satisfaction_indicators': satisfaction_indicators,
+                'themes': themes,
+                'quality': quality
             }
-            
-            if turn['speaker'] == 'AGENT':
-                agent_timeline.append(timeline_entry)
-                agent_texts.append(content)
-            else:
-                customer_timeline.append(timeline_entry)
-                customer_texts.append(content)
-        
-        agent_themes = self.analyzer.extract_themes_batch([agent_texts], 5)[0] if agent_texts else []
-        customer_themes = self.analyzer.extract_themes_batch([customer_texts], 5)[0] if customer_texts else []
         
         return {
-            'agent_sentiment_timeline': agent_timeline,
-            'customer_sentiment_timeline': customer_timeline,
-            'agent_themes': agent_themes,
-            'customer_themes': customer_themes
+            'speaker_type': 'unknown',
+            'themes': themes,
+            'quality': quality
         }
-
-def load_dataframe_from_file(uploaded_file) -> Optional[pd.DataFrame]:
-    """Load DataFrame from uploaded file with Parquet optimization"""
-    try:
-        file_extension = uploaded_file.name.lower().split('.')[-1]
+    
+    def extract_speaker_turns(self, text, timestamp_col=None, speaker_col=None):
+        """Extract turn-by-turn analysis"""
+        turns = []
         
-        if file_extension in ['xlsx', 'xls']:
-            if not OPENPYXL_AVAILABLE:
-                st.error("Excel support not available. Please install openpyxl.")
-                return None
-            df = pd.read_excel(uploaded_file)
-        elif file_extension == 'csv':
-            encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252']
-            df = None
+        # Simple pattern matching for speaker identification if not provided
+        if speaker_col is None:
+            agent_patterns = r'(agent|rep|representative|advisor)[:|-]?\s*(.*?)(?=customer|client|caller|$)'
+            customer_patterns = r'(customer|client|caller|user)[:|-]?\s*(.*?)(?=agent|rep|representative|$)'
             
-            for encoding in encodings:
-                try:
-                    content = uploaded_file.read().decode(encoding)
-                    uploaded_file.seek(0)
-                    df = pd.read_csv(io.StringIO(content))
-                    break
-                except UnicodeDecodeError:
-                    uploaded_file.seek(0)
-                    continue
+            agent_matches = re.findall(agent_patterns, str(text), re.IGNORECASE | re.DOTALL)
+            customer_matches = re.findall(customer_patterns, str(text), re.IGNORECASE | re.DOTALL)
             
-            if df is None:
-                st.error("Could not decode CSV file. Please check encoding.")
-                return None
+            for i, match in enumerate(agent_matches):
+                turns.append({
+                    'turn_number': i + 1,
+                    'speaker': 'Agent',
+                    'text': match[1].strip(),
+                    'timestamp': f"Turn {i+1}"
+                })
+            
+            for i, match in enumerate(customer_matches):
+                turns.append({
+                    'turn_number': i + 1,
+                    'speaker': 'Customer',
+                    'text': match[1].strip(),
+                    'timestamp': f"Turn {i+1}"
+                })
+        
+        return turns
+    
+    def process_transcript(self, df, text_col, speaker_col=None, timestamp_col=None, parallel=False):
+        """Enhanced main processing function with detailed analysis"""
+        results = []
+        
+        def process_row(row):
+            text = row[text_col]
+            speaker = row.get(speaker_col, 'Unknown') if speaker_col else 'Unknown'
+            
+            # Get sentiment scores
+            vader_compound, vader_pos, vader_neg, textblob_pol = self.get_sentiment_scores(text)
+            
+            # Predict NPS
+            nps_score = self.predict_nps(vader_compound, vader_pos, vader_neg)
+            
+            # Enhanced coaching theme analysis
+            themes = self.identify_coaching_themes(text)
+            
+            # Calculate coaching priority
+            coaching_priority = self.calculate_coaching_priority(themes)
+            
+            # Get top themes with scores
+            top_themes = sorted(themes.items(), key=lambda x: x[1]['score'], reverse=True)[:3]
+            top_theme = top_themes[0][0] if top_themes else 'none'
+            
+            # Speaker-specific analysis
+            speaker_analysis = self.analyze_customer_agent_interaction(text, speaker)
+            
+            # Format themes for display
+            themes_summary = {}
+            for theme, details in themes.items():
+                themes_summary[theme] = {
+                    'score': details['score'],
+                    'top_phrases': details['matched_phrases'][:3]
+                }
+            
+            return {
+                'transcript_text': text[:200] + '...' if len(text) > 200 else text,
+                'speaker': speaker,
+                'vader_compound': round(vader_compound, 3),
+                'vader_positive': round(vader_pos, 3),
+                'vader_negative': round(vader_neg, 3),
+                'textblob_polarity': round(textblob_pol, 3),
+                'predicted_nps': nps_score,
+                'coaching_priority_score': round(coaching_priority, 2),
+                'top_coaching_theme': top_theme,
+                'theme_count': len(themes),
+                'detailed_themes': str(themes_summary),
+                'speaker_analysis': str(speaker_analysis.get('coaching_focus', [])) if speaker_analysis['speaker_type'] == 'agent' else str(speaker_analysis.get('satisfaction_indicators', [])),
+                'quality_score': speaker_analysis['quality']['quality_score'],
+                'quality_indicators': str(speaker_analysis['quality']['indicators']),
+                'timestamp': row.get(timestamp_col, 'N/A') if timestamp_col else 'N/A'
+            }
+        
+        if parallel and len(df) > 100:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = {executor.submit(process_row, row): idx for idx, row in df.iterrows()}
                 
-        elif file_extension == 'txt':
-            content = uploaded_file.read().decode('utf-8')
-            lines = [line.strip() for line in content.split('\n') if line.strip()]
-            df = pd.DataFrame({'transcript': lines})
+                progress_bar = st.progress(0)
+                for i, future in enumerate(as_completed(futures)):
+                    results.append(future.result())
+                    progress_bar.progress((i + 1) / len(futures))
         else:
-            st.error(f"Unsupported file format: {file_extension}")
-            return None
+            progress_bar = st.progress(0)
+            for i, (_, row) in enumerate(df.iterrows()):
+                results.append(process_row(row))
+                progress_bar.progress((i + 1) / len(df))
         
-        if df.empty:
-            st.error("File is empty or contains no valid data.")
-            return None
+        return pd.DataFrame(results)
+
+def convert_to_parquet(df, filename):
+    """Convert DataFrame to Parquet format"""
+    with st.spinner(f"Converting {filename} to Parquet format..."):
+        table = pa.Table.from_pandas(df)
+        return table
+
+def load_file(uploaded_file):
+    """Load and convert file to DataFrame"""
+    try:
+        filename = uploaded_file.name
+        file_ext = filename.split('.')[-1].lower()
         
-        df = clean_dataframe(df)
-        
-        # Parquet optimization for large files
-        if len(df) > 1000 and PYARROW_AVAILABLE:
-            try:
-                table = pa.Table.from_pandas(df)
-                optimized_df = table.to_pandas()
-                
-                string_cols = ['transcript', 'agent', 'customer']
-                for col in string_cols:
-                    if col in optimized_df.columns:
-                        optimized_df[col] = optimized_df[col].astype('string')
-                
-                if 'id' in optimized_df.columns:
-                    optimized_df['id'] = pd.to_numeric(optimized_df['id'], downcast='integer', errors='coerce')
-                
-                st.info(f"Applied Parquet optimization for {len(df)} conversations")
-                return optimized_df
-                
-            except Exception as e:
-                st.warning(f"Parquet optimization failed: {e}, using standard format")
-                return df
-        
-        return df
-        
+        with st.spinner(f"Loading {filename}..."):
+            if file_ext == 'csv':
+                df = pd.read_csv(uploaded_file)
+            elif file_ext in ['xlsx', 'xls']:
+                df = pd.read_excel(uploaded_file)
+            else:
+                st.error("Unsupported file format. Please upload CSV, XLS, or XLSX files.")
+                return None
+            
+            # Convert to Parquet
+            parquet_table = convert_to_parquet(df, filename)
+            df_from_parquet = parquet_table.to_pandas()
+            
+            st.success(f"✅ File loaded and converted to Parquet: {len(df_from_parquet)} rows, {len(df_from_parquet.columns)} columns")
+            return df_from_parquet
+    
     except Exception as e:
-        st.error(f"Error loading file: {e}")
+        st.error(f"Error loading file: {str(e)}")
         return None
 
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Clean and standardize DataFrame"""
-    transcript_col = detect_transcript_column(df)
-    if transcript_col and transcript_col != 'transcript':
-        df = df.rename(columns={transcript_col: 'transcript'})
-    
-    if 'transcript' not in df.columns:
-        if len(df.columns) > 0:
-            df['transcript'] = df.iloc[:, 0].astype(str)
-        else:
-            raise ValueError("No valid transcript data found")
-    
-    df = df.dropna(subset=['transcript'])
-    df['transcript'] = df['transcript'].astype(str).str.strip()
-    df = df[df['transcript'] != '']
-    df = df[df['transcript'].str.lower() != 'nan']
-    
-    if 'id' not in df.columns:
-        df['id'] = range(1, len(df) + 1)
-    
-    for col in df.columns:
-        col_lower = str(col).lower()
-        
-        if 'agent' in col_lower and 'agent' not in df.columns:
-            df = df.rename(columns={col: 'agent'})
-        elif 'customer' in col_lower and 'customer' not in df.columns:
-            df = df.rename(columns={col: 'customer'})
-        elif 'date' in col_lower and 'date' not in df.columns:
-            df = df.rename(columns={col: 'date'})
-            try:
-                df['date'] = pd.to_datetime(df['date'], errors='coerce')
-            except:
-                pass
-    
-    return df.reset_index(drop=True)
-
-def detect_transcript_column(df: pd.DataFrame) -> Optional[str]:
-    """Detect transcript column"""
-    patterns = ['transcript', 'text', 'conversation', 'dialogue', 'content', 'message']
-    
-    for col in df.columns:
-        col_lower = str(col).lower()
-        if any(pattern in col_lower for pattern in patterns):
-            return col
-    
-    for col in df.columns:
-        if df[col].dtype == 'object':
-            sample_val = str(df[col].dropna().iloc[0] if not df[col].dropna().empty else "")
-            if len(sample_val) > 10:
-                return col
-    
-    return df.columns[0] if len(df.columns) > 0 else None
-
-def process_conversations_optimized(df: pd.DataFrame, sentiment_method: str = "vader") -> pd.DataFrame:
-    """Optimized conversation processing with selectable sentiment analysis method"""
-    analyzer = ConversationAnalyzer(sentiment_method=sentiment_method)
-    processor = TranscriptProcessor(analyzer)
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    total_rows = len(df)
-    
-    # Step 1: Batch transcript parsing
-    status_text.text("Parsing conversation structures...")
-    progress_bar.progress(10)
-    
-    parsed_transcripts = []
-    flow_analyses = []
-    
-    for idx, row in df.iterrows():
-        transcript = str(row.get('transcript', ''))
-        if len(transcript.strip()) < 10:
-            parsed_transcripts.append(processor._empty_parse_result(transcript))
-            flow_analyses.append({
-                'agent_sentiment_timeline': [],
-                'customer_sentiment_timeline': [],
-                'agent_themes': [],
-                'customer_themes': []
-            })
-        else:
-            parsed = processor.parse_timestamped_transcript(transcript)
-            parsed_transcripts.append(parsed)
-            
-            flow = processor.analyze_conversation_flow(parsed)
-            flow_analyses.append(flow)
-    
-    progress_bar.progress(30)
-    
-    # Step 2: Batch sentiment analysis
-    status_text.text(f"Analyzing sentiment using {sentiment_method.upper()}...")
-    
-    all_transcripts = [str(row.get('transcript', '')) for _, row in df.iterrows()]
-    valid_transcripts = [t for t in all_transcripts if len(t.strip()) >= 10]
-    
-    if valid_transcripts:
-        chunk_size = 64 if sentiment_method == "vader" else 32
-        all_sentiment_scores = []
-        
-        for i in range(0, len(all_transcripts), chunk_size):
-            chunk = all_transcripts[i:i + chunk_size]
-            chunk_results = analyzer.analyze_sentiment_batch(chunk)
-            all_sentiment_scores.extend(chunk_results)
-            
-            progress = 30 + int((i / len(all_transcripts)) * 40)
-            progress_bar.progress(min(progress, 70))
-    else:
-        all_sentiment_scores = [{'positive': 0.33, 'neutral': 0.34, 'negative': 0.33}] * len(all_transcripts)
-    
-    progress_bar.progress(70)
-    
-    # Step 3: Batch compliance checking
-    status_text.text("Checking compliance across all conversations...")
-    
-    compliance_results = analyzer.check_compliance_batch(all_transcripts)
-    
-    progress_bar.progress(80)
-    
-    # Step 4: Calculate metrics
-    status_text.text("Calculating performance metrics...")
-    
-    results = []
-    
-    for idx, (row, parsed_transcript, flow_analysis, sentiment_scores, compliance_result) in enumerate(
-        zip(df.itertuples(), parsed_transcripts, flow_analyses, all_sentiment_scores, compliance_results)
-    ):
-        try:
-            transcript = str(getattr(row, 'transcript', ''))
-            
-            primary_sentiment = max(sentiment_scores, key=sentiment_scores.get)
-            
-            nps_score = analyzer.calculate_nps_score(sentiment_scores)
-            coaching_priority = analyzer.calculate_coaching_priority(
-                sentiment_scores, compliance_result, parsed_transcript.get('turn_count', 0)
-            )
-            
-            result = {
-                'id': int(getattr(row, 'id', idx + 1)),
-                'transcript': transcript[:200] + "..." if len(transcript) > 200 else transcript,
-                'agent': str(parsed_transcript.get('agent_name', getattr(row, 'agent', 'Agent'))),
-                'customer': str(parsed_transcript.get('customer_name', getattr(row, 'customer', 'Customer'))),
-                'date': getattr(row, 'date', datetime.now()),
-                
-                'sentiment_positive': float(sentiment_scores.get('positive', 0)),
-                'sentiment_neutral': float(sentiment_scores.get('neutral', 0)),
-                'sentiment_negative': float(sentiment_scores.get('negative', 0)),
-                'primary_sentiment': str(primary_sentiment),
-                
-                'nps_score': float(nps_score),
-                'compliance_score': float(compliance_result['score']),
-                'coaching_priority': float(coaching_priority),
-                'compliance_missing': ', '.join(compliance_result['missing_keywords']),
-                
-                'has_timestamps': bool(parsed_transcript['has_timestamps']),
-                'conversation_duration': int(parsed_transcript.get('total_duration', 0)),
-                'turn_count': int(parsed_transcript.get('turn_count', 0)),
-                'agent_talk_time': len(parsed_transcript.get('agent_text', '').split()),
-                'customer_talk_time': len(parsed_transcript.get('customer_text', '').split()),
-                
-                'agent_themes': ', '.join(flow_analysis.get('agent_themes', [])[:3]),
-                'customer_themes': ', '.join(flow_analysis.get('customer_themes', [])[:3]),
-                
-                'agent_sentiment_timeline': json.dumps(flow_analysis.get('agent_sentiment_timeline', [])),
-                'customer_sentiment_timeline': json.dumps(flow_analysis.get('customer_sentiment_timeline', []))
-            }
-            
-            results.append(result)
-            
-        except Exception as e:
-            logger.error(f"Error processing conversation {idx}: {e}")
-            continue
-    
-    progress_bar.progress(100)
-    status_text.text("Processing complete!")
-    
-    return pd.DataFrame(results)
-
 def main():
-    """Main Streamlit app"""
+    st.title("📞 Call Center Agent Coaching Analytics")
+    st.markdown("*Transform call transcripts into actionable coaching insights*")
     
-    # Header
-    st.markdown("""
-    <div class="main-header">
-        <h1>GenCoachingIQ</h1>
-        <p>AI-Powered Conversation Analytics & Intelligent Coaching Insights</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Initialize session state
-    if 'results_df' not in st.session_state:
-        st.session_state.results_df = None
-    if 'summary_stats' not in st.session_state:
-        st.session_state.summary_stats = None
-    
-    # Tabs
-    tab1, tab2, tab3 = st.tabs(["Upload & Process", "Results", "User Guide"])
-    
-    with tab1:
-        st.header("Upload & Process Conversations")
+    # Sidebar Configuration
+    with st.sidebar:
+        st.header("🔧 Configuration")
         
-        col1, col2 = st.columns([2, 1])
+        # Processing options
+        st.subheader("Processing Options")
+        parallel_processing = st.checkbox("Enable Parallel Processing", help="Faster processing for large datasets")
+        enable_cache = st.checkbox("Enable Session Cache", value=True, help="Cache results for faster re-processing")
+        
+        # File upload section
+        st.subheader("📁 File Upload")
+        uploaded_file = st.file_uploader(
+            "Upload transcript file",
+            type=['csv', 'xlsx', 'xls'],
+            help="Supported formats: CSV, Excel (.xlsx, .xls)"
+        )
+    
+    # Main content area
+    if uploaded_file is not None:
+        # Load file
+        if not st.session_state.file_uploaded or st.session_state.get('last_file') != uploaded_file.name:
+            df = load_file(uploaded_file)
+            if df is not None:
+                st.session_state.df = df
+                st.session_state.file_uploaded = True
+                st.session_state.last_file = uploaded_file.name
+            else:
+                st.stop()
+        else:
+            df = st.session_state.df
+        
+        # Column selection
+        st.subheader("🎯 Column Configuration")
+        col1, col2, col3 = st.columns(3)
         
         with col1:
-            uploaded_file = st.file_uploader(
-                "Choose file containing call transcripts",
-                type=['xlsx', 'xls', 'csv', 'txt'],
-                help="Upload Excel, CSV, or text files. Supports timestamped format: [12:30:08 AGENT]: message"
+            text_column = st.selectbox(
+                "Select Text/Transcript Column",
+                options=df.columns.tolist(),
+                help="Column containing the conversation transcript"
             )
-            
-            if uploaded_file:
-                file_size_mb = uploaded_file.size / (1024*1024)
-                if file_size_mb > 500:
-                    st.error(f"File too large: {file_size_mb:.1f} MB. Maximum size is 500 MB.")
-                else:
-                    st.success(f"File uploaded: {uploaded_file.name} ({file_size_mb:.1f} MB)")
         
         with col2:
-            st.markdown("""
-            **Advanced Processing Options**
-            - Timestamped conversation parsing
-            - Agent vs Customer analysis
-            - Turn-by-turn sentiment tracking
-            - Theme extraction by speaker
-            - Coaching priority scoring
-            """)
-            
-            # Sentiment Analysis Method Selection
-            st.subheader("Sentiment Analysis Method")
-            
-            sentiment_options = {
-                "vader": {
-                    "name": "VADER (Recommended)",
-                    "accuracy": "82-85%",
-                    "speed": "Very Fast",
-                    "best_for": "Customer service, informal text",
-                    "time_estimate": "5-15 minutes for 100k conversations"
-                },
-                "textblob": {
-                    "name": "TextBlob",
-                    "accuracy": "75-80%", 
-                    "speed": "Fast",
-                    "best_for": "General text analysis",
-                    "time_estimate": "10-30 minutes for 100k conversations"
-                },
-                "transformers": {
-                    "name": "Advanced AI (Transformers)",
-                    "accuracy": "88-92%",
-                    "speed": "Slow",
-                    "best_for": "High accuracy requirements",
-                    "time_estimate": "2-8 hours for 100k conversations"
-                }
-            }
-            
-            selected_method = st.selectbox(
-                "Choose sentiment analysis method:",
-                options=list(sentiment_options.keys()),
-                format_func=lambda x: sentiment_options[x]["name"],
-                index=0
+            speaker_column = st.selectbox(
+                "Select Speaker Column (Optional)",
+                options=['None'] + df.columns.tolist(),
+                help="Column identifying agent vs customer"
             )
+            speaker_column = None if speaker_column == 'None' else speaker_column
+        
+        with col3:
+            timestamp_column = st.selectbox(
+                "Select Timestamp Column (Optional)",
+                options=['None'] + df.columns.tolist(),
+                help="Column containing conversation timestamps"
+            )
+            timestamp_column = None if timestamp_column == 'None' else timestamp_column
+        
+        # Additional columns to include
+        st.subheader("📊 Additional Columns to Include in Output")
+        additional_columns = st.multiselect(
+            "Select additional columns for final output",
+            options=[col for col in df.columns if col not in [text_column, speaker_column, timestamp_column]],
+            help="These columns will be included in your final export"
+        )
+        
+        # Process button
+        if st.button("🚀 Start Analysis", type="primary"):
+            analyzer = CallCenterAnalyzer()
             
-            method_info = sentiment_options[selected_method]
-            st.info(f"""
-            **{method_info['name']}**
-            - Accuracy: {method_info['accuracy']}
-            - Speed: {method_info['speed']}
-            - Best for: {method_info['best_for']}
-            - Estimated time: {method_info['time_estimate']}
-            """)
+            with st.spinner("Processing transcripts and analyzing coaching themes..."):
+                start_time = time.time()
+                
+                # Main analysis
+                results_df = analyzer.process_transcript(
+                    df, text_column, speaker_column, timestamp_column, parallel_processing
+                )
+                
+                # Add additional columns
+                for col in additional_columns:
+                    results_df[col] = df[col]
+                
+                processing_time = time.time() - start_time
+                
+                st.session_state.processed_data = results_df
+                st.success(f"✅ Analysis completed in {processing_time:.2f} seconds!")
         
-        if uploaded_file and uploaded_file.size <= 500 * 1024 * 1024:
-            if st.button("Start Analysis", type="primary", use_container_width=True):
-                with st.spinner("Processing conversations..."):
-                    df = load_dataframe_from_file(uploaded_file)
-                    
-                    if df is not None and not df.empty:
-                        method_info = sentiment_options[selected_method]
-                        st.info(f"Processing {len(df)} conversations using {method_info['name']}...")
-                        st.info(f"Expected completion: {method_info['time_estimate']}")
-                        
-                        results_df = process_conversations_optimized(df, selected_method)
-                        
-                        if not results_df.empty:
-                            summary_stats = {
-                                'total_calls': len(results_df),
-                                'avg_nps': float(results_df['nps_score'].mean()),
-                                'avg_sentiment': float(results_df['sentiment_positive'].mean()),
-                                'compliance_rate': float(results_df['compliance_score'].mean()),
-                                'high_priority_calls': len(results_df[results_df['coaching_priority'] > 7]),
-                                'timestamped_conversations': len(results_df[results_df['has_timestamps'] == True]),
-                                'processing_date': datetime.now(),
-                                'sentiment_method': method_info['name']
-                            }
-                            
-                            st.session_state.results_df = results_df
-                            st.session_state.summary_stats = summary_stats
-                            
-                            st.success(f"Successfully analyzed {len(results_df)} conversations using {method_info['name']}!")
-                            
-                            with st.expander("Analysis Preview", expanded=True):
-                                preview_cols = ['id', 'agent', 'customer', 'primary_sentiment', 'nps_score', 
-                                              'coaching_priority', 'has_timestamps', 'agent_themes']
-                                available_cols = [col for col in preview_cols if col in results_df.columns]
-                                st.dataframe(results_df[available_cols].head(5), use_container_width=True)
-                        else:
-                            st.error("No valid conversations found in the uploaded file.")
-                    else:
-                        st.error("Failed to process file. Please check file format and content.")
-    
-    with tab2:
-        st.header("Results & Analytics")
-        
-        if st.session_state.results_df is None:
-            st.info("No analysis results available. Please upload and process data first.")
-        else:
-            results_df = st.session_state.results_df
-            summary_stats = st.session_state.summary_stats
+        # Display results
+        if st.session_state.processed_data is not None:
+            results_df = st.session_state.processed_data
             
             # Summary metrics
+            st.subheader("📈 Analysis Summary")
             col1, col2, col3, col4, col5 = st.columns(5)
             
             with col1:
-                st.metric("Total Conversations", summary_stats['total_calls'])
+                avg_nps = results_df['predicted_nps'].mean()
+                st.metric("Average Predicted NPS", f"{avg_nps:.1f}")
+            
             with col2:
-                st.metric("Avg Coaching Score", f"{summary_stats['avg_nps']:.1f}")
+                avg_sentiment = results_df['vader_compound'].mean()
+                st.metric("Average Sentiment", f"{avg_sentiment:.2f}")
+            
             with col3:
-                st.metric("High Priority", summary_stats['high_priority_calls'])
+                avg_coaching_priority = results_df['coaching_priority_score'].mean()
+                st.metric("Avg Coaching Priority", f"{avg_coaching_priority:.1f}")
+            
             with col4:
-                st.metric("Compliance Rate", f"{summary_stats['compliance_rate']:.1f}%")
+                high_priority_count = len(results_df[results_df['coaching_priority_score'] < -2])
+                st.metric("Critical Issues", high_priority_count)
+            
             with col5:
-                st.metric("Enhanced Analysis", f"{summary_stats['timestamped_conversations']}/{summary_stats['total_calls']}")
+                total_transcripts = len(results_df)
+                st.metric("Total Transcripts", total_transcripts)
             
-            # Visualizations
-            if PLOTLY_AVAILABLE:
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    sentiment_counts = results_df['primary_sentiment'].value_counts()
-                    fig = px.pie(
-                        values=sentiment_counts.values,
-                        names=sentiment_counts.index,
-                        title="Sentiment Distribution",
-                        color_discrete_map={
-                            'positive': '#2E8B57',
-                            'negative': '#DC143C',
-                            'neutral': '#FFD700'
-                        }
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                with col2:
-                    priority_bins = pd.cut(
-                        results_df['coaching_priority'], 
-                        bins=[0, 3, 6, 8, 10], 
-                        labels=['Low', 'Medium', 'High', 'Critical']
-                    )
-                    priority_counts = priority_bins.value_counts()
-                    
-                    fig = px.bar(
-                        x=priority_counts.index, 
-                        y=priority_counts.values,
-                        title="Coaching Priority Distribution",
-                        labels={'x': 'Priority Level', 'y': 'Count'},
-                        color=priority_counts.values,
-                        color_continuous_scale='Reds'
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
+            # Coaching Priority Analysis
+            st.subheader("🎯 Coaching Priority Breakdown")
             
-            # Data table with filters
-            st.subheader("Conversation Analysis Results")
+            priority_col1, priority_col2 = st.columns(2)
             
+            with priority_col1:
+                # Critical coaching needs
+                critical_issues = results_df[results_df['coaching_priority_score'] < -2]
+                if len(critical_issues) > 0:
+                    st.error(f"🚨 {len(critical_issues)} transcripts require immediate coaching intervention")
+                    st.dataframe(
+                        critical_issues[['speaker', 'coaching_priority_score', 'top_coaching_theme', 'speaker_analysis']].head(),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.success("✅ No critical coaching issues identified")
+            
+            with priority_col2:
+                # Positive coaching examples
+                positive_examples = results_df[results_df['coaching_priority_score'] > 2]
+                if len(positive_examples) > 0:
+                    st.success(f"⭐ {len(positive_examples)} examples of excellent performance")
+                    st.dataframe(
+                        positive_examples[['speaker', 'coaching_priority_score', 'top_coaching_theme', 'quality_score']].head(),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.info("💡 Consider highlighting positive coaching examples")
+            
+            # Main results table
+            st.subheader("🎯 Coaching Analysis Results")
+            
+            # Display options
             col1, col2, col3 = st.columns(3)
-            
             with col1:
-                sentiment_filter = st.selectbox(
-                    "Filter by Sentiment", 
-                    ["All", "positive", "negative", "neutral"]
+                show_columns = st.multiselect(
+                    "Select columns to display",
+                    options=results_df.columns.tolist(),
+                    default=['speaker', 'predicted_nps', 'coaching_priority_score', 'top_coaching_theme', 'quality_score']
                 )
+            
             with col2:
-                nps_range = st.slider(
-                    "Coaching Score Range", 
-                    min_value=0.0, 
-                    max_value=100.0, 
-                    value=(0.0, 100.0)
+                filter_theme = st.selectbox(
+                    "Filter by coaching theme",
+                    options=['All'] + results_df['top_coaching_theme'].unique().tolist()
                 )
+            
             with col3:
                 priority_filter = st.selectbox(
-                    "Priority Level", 
-                    ["All", "High (7-10)", "Medium (4-7)", "Low (1-4)"]
+                    "Filter by coaching priority",
+                    options=['All', 'Critical (< -2)', 'Needs Improvement (< 0)', 'Good Performance (> 2)']
                 )
             
             # Apply filters
-            filtered_df = results_df.copy()
+            display_df = results_df.copy()
+            if filter_theme != 'All':
+                display_df = display_df[display_df['top_coaching_theme'] == filter_theme]
             
-            if sentiment_filter != "All":
-                filtered_df = filtered_df[filtered_df['primary_sentiment'] == sentiment_filter]
+            if priority_filter != 'All':
+                if priority_filter == 'Critical (< -2)':
+                    display_df = display_df[display_df['coaching_priority_score'] < -2]
+                elif priority_filter == 'Needs Improvement (< 0)':
+                    display_df = display_df[display_df['coaching_priority_score'] < 0]
+                elif priority_filter == 'Good Performance (> 2)':
+                    display_df = display_df[display_df['coaching_priority_score'] > 2]
             
-            filtered_df = filtered_df[
-                (filtered_df['nps_score'] >= nps_range[0]) &
-                (filtered_df['nps_score'] <= nps_range[1])
-            ]
-            
-            if priority_filter != "All":
-                if priority_filter == "High (7-10)":
-                    filtered_df = filtered_df[filtered_df['coaching_priority'] >= 7]
-                elif priority_filter == "Medium (4-7)":
-                    filtered_df = filtered_df[
-                        (filtered_df['coaching_priority'] >= 4) & 
-                        (filtered_df['coaching_priority'] < 7)
-                    ]
-                else:
-                    filtered_df = filtered_df[filtered_df['coaching_priority'] < 4]
-            
-            # Display table
-            display_cols = [
-                'id', 'agent', 'customer', 'primary_sentiment', 'nps_score', 
-                'coaching_priority', 'has_timestamps', 'agent_themes', 'customer_themes'
-            ]
-            available_cols = [col for col in display_cols if col in filtered_df.columns]
+            if show_columns:
+                display_df = display_df[show_columns]
             
             st.dataframe(
-                filtered_df[available_cols],
+                display_df,
                 use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "nps_score": st.column_config.ProgressColumn(
-                        "Coaching Score", 
-                        min_value=0, 
-                        max_value=100
-                    ),
-                    "coaching_priority": st.column_config.ProgressColumn(
-                        "Priority", 
-                        min_value=1, 
-                        max_value=10
-                    ),
-                    "has_timestamps": st.column_config.CheckboxColumn("Enhanced")
-                }
+                hide_index=True
             )
             
-            st.info(f"Showing {len(filtered_df)} of {len(results_df)} conversations")
+            # Turn-by-turn analysis if speaker column provided
+            if speaker_column and speaker_column in df.columns:
+                st.subheader("🔄 Turn-by-Turn Analysis")
+                
+                turn_results = []
+                progress_bar = st.progress(0)
+                
+                for i, row in df.iterrows():
+                    turns = analyzer.extract_speaker_turns(
+                        row[text_column], 
+                        timestamp_column, 
+                        speaker_column
+                    )
+                    
+                    for turn in turns:
+                        sentiment_scores = analyzer.get_sentiment_scores(turn['text'])
+                        themes = analyzer.identify_coaching_themes(turn['text'])
+                        
+                        turn_results.append({
+                            'transcript_id': i,
+                            'turn_number': turn['turn_number'],
+                            'speaker': turn['speaker'],
+                            'text': turn['text'][:100] + '...' if len(turn['text']) > 100 else turn['text'],
+                            'sentiment': sentiment_scores[0],
+                            'coaching_themes': list(themes.keys()),
+                            'timestamp': turn['timestamp']
+                        })
+                    
+                    progress_bar.progress((i + 1) / len(df))
+                
+                if turn_results:
+                    turn_df = pd.DataFrame(turn_results)
+                    st.session_state.turn_analysis = turn_df
+                    st.dataframe(
+                        turn_df,
+                        use_container_width=True,
+                        hide_index=True
+                    )
             
             # Export options
-            st.subheader("Export Results")
-            
-            col1, col2, col3 = st.columns(3)
+            st.subheader("📤 Export Results")
+            col1, col2 = st.columns(2)
             
             with col1:
-                csv_buffer = io.StringIO()
-                filtered_df.to_csv(csv_buffer, index=False, encoding='utf-8')
-                csv_data = csv_buffer.getvalue()
-                
+                # CSV export
+                csv = results_df.to_csv(index=False)
                 st.download_button(
                     label="Download CSV",
-                    data=csv_data,
-                    file_name=f"gencoachingiq_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                    help="CSV format optimized for Power BI and Excel"
+                    data=csv,
+                    file_name=f"coaching_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
                 )
             
             with col2:
-                if OPENPYXL_AVAILABLE:
-                    try:
-                        excel_buffer = io.BytesIO()
-                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                            filtered_df.to_excel(writer, sheet_name='Analysis Results', index=False)
-                            
-                            summary_data = {
-                                'total_conversations': [len(filtered_df)],
-                                'avg_nps_score': [filtered_df['nps_score'].mean()],
-                                'avg_sentiment_positive': [filtered_df['sentiment_positive'].mean()],
-                                'compliance_rate': [filtered_df['compliance_score'].mean()],
-                                'high_priority_count': [len(filtered_df[filtered_df['coaching_priority'] > 7])],
-                                'timestamped_conversations': [len(filtered_df[filtered_df['has_timestamps'] == True])],
-                                'processing_date': [datetime.now()]
-                            }
-                            summary_df = pd.DataFrame(summary_data)
-                            summary_df.to_excel(writer, sheet_name='Summary', index=False)
-                            
-                            metadata = {
-                                'Export Date': [datetime.now()],
-                                'Total Records': [len(filtered_df)],
-                                'Enhanced Records': [len(filtered_df[filtered_df['has_timestamps'] == True])],
-                                'Data Columns': [len(filtered_df.columns)]
-                            }
-                            metadata_df = pd.DataFrame(metadata)
-                            metadata_df.to_excel(writer, sheet_name='Metadata', index=False)
-                        
-                        st.download_button(
-                            label="Download Excel",
-                            data=excel_buffer.getvalue(),
-                            file_name=f"gencoachingiq_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True,
-                            help="Excel with multiple sheets including summary"
-                        )
-                    except Exception as e:
-                        st.error(f"Excel export failed: {e}")
-                else:
-                    st.info("Excel export requires openpyxl package")
-            
-            with col3:
-                json_data = filtered_df.to_json(orient='records', date_format='iso', indent=2)
+                # Excel export
+                output = BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    results_df.to_excel(writer, sheet_name='Coaching Analysis', index=False)
+                    if st.session_state.turn_analysis is not None:
+                        st.session_state.turn_analysis.to_excel(writer, sheet_name='Turn Analysis', index=False)
                 
                 st.download_button(
-                    label="Download JSON",
-                    data=json_data,
-                    file_name=f"gencoachingiq_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                    mime="application/json",
-                    use_container_width=True,
-                    help="JSON format for API integration"
+                    label="Download Excel",
+                    data=output.getvalue(),
+                    file_name=f"coaching_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
     
-    with tab3:
-        st.header("User Guide")
+    else:
+        st.info("👈 Please upload a file to get started")
         
-        st.markdown("""
-        ## Getting Started with GenCoachingIQ
-        
-        ### Step 1: Prepare Your Data
-        **Supported Formats**: Excel (.xlsx, .xls), CSV (.csv), Text (.txt) files up to 500MB
-        
-        **Enhanced Timestamped Format** (Recommended):
-        ```
-        [12:30:08 AGENT]: How can I help you today?
-        [12:30:15 CUSTOMER]: I have an issue with my account
-        [12:30:20 AGENT]: I'd be happy to help with that issue
-        ```
-        
-        **Basic Format**: Simple transcript text (one conversation per row/line)
-        
-        ### Step 2: Choose Sentiment Analysis Method
-        - **VADER (Recommended)**: Fast and accurate for customer service (5-15 min for 100k conversations)
-        - **TextBlob**: General purpose, good balance (10-30 min for 100k conversations)
-        - **Transformers**: Most accurate but slowest (2-8 hours for 100k conversations)
-        
-        ### Step 3: Upload and Process
-        1. Go to the "Upload & Process" tab
-        2. Choose your sentiment analysis method
-        3. Upload your conversation data
-        4. Click "Start Analysis"
-        5. Monitor progress and review the preview
-        
-        ### Step 4: Analyze Results
-        - View summary metrics and visualizations
-        - Filter conversations by sentiment, score, or priority
-        - Export results in CSV, Excel, or JSON format
-        
-        ### Key Features
-        
-        **Conversation Analysis**:
-        - Sentiment analysis (positive/neutral/negative)
-        - Coaching score calculation (0-100)
-        - Priority ranking (1-10 scale)
-        - Compliance keyword checking
-        
-        **Enhanced Features** (with timestamps):
-        - Turn-by-turn sentiment tracking
-        - Speaker separation (agent vs customer)
-        - Theme extraction by speaker
-        - Conversation duration analysis
-        
-        **Performance Optimizations**:
-        - Parquet conversion for large files
-        - Batch processing for faster sentiment analysis
-        - Multiple sentiment analysis options for speed vs accuracy
-        
-        ### Metrics Explained
-        - **Coaching Score**: Overall performance rating (80-100 = Excellent, 60-79 = Good, 40-59 = Average, 0-39 = Needs Improvement)
-        - **Coaching Priority**: Urgency for coaching intervention (8-10 = Critical, 5-7 = High, 3-4 = Medium, 1-2 = Low)
-        - **Compliance Score**: Percentage of required keywords found
-        
-        ### Tips for Best Results
-        1. Use VADER for large datasets (100k+ conversations)
-        2. Use timestamped format for enhanced analysis
-        3. Ensure clear speaker identification (AGENT vs CUSTOMER)
-        4. Process files regularly to track improvement trends
-        
-        ### Troubleshooting
-        - **File not loading**: Check format is supported and file isn't corrupted
-        - **Processing slow**: Choose VADER or TextBlob for faster processing
-        - **Missing data**: Ensure transcript column exists and contains text
-        - **Memory issues**: Process in smaller batches if file is very large
-        """)
+        # Help section
+        with st.expander("ℹ️ How to use this app"):
+            st.markdown("""
+            ### Step-by-Step Guide:
+            
+            1. **Upload File**: Upload your call transcript file (CSV, Excel)
+            2. **Configure Columns**: Select which columns contain transcript text, speaker info, and timestamps
+            3. **Choose Output Columns**: Select additional columns to include in your analysis
+            4. **Run Analysis**: Click 'Start Analysis' to process your data
+            5. **Review Results**: Examine coaching themes, sentiment scores, and NPS predictions
+            6. **Export Data**: Download results in CSV or Excel format
+            
+            ### Features:
+            - 🎯 **Coaching Theme Detection**: Identifies areas for improvement beyond simple keywords
+            - 📊 **NPS Prediction**: Estimates Net Promoter Score based on conversation sentiment
+            - 🔄 **Turn-by-Turn Analysis**: Analyzes agent vs customer interactions separately
+            - ⚡ **Parallel Processing**: Faster analysis for large datasets
+            - 💾 **Smart Caching**: Optimized performance with session caching
+            """)
 
 if __name__ == "__main__":
     main()

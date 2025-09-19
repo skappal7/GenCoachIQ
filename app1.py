@@ -90,7 +90,7 @@ class ArrowVectorizedEngine:
                     parquet_buffer,
                     compression='snappy',
                     use_dictionary=True,
-                    row_group_size=50000,
+                    row_group_size=20000,
                     use_compliant_nested_type=True,
                     write_statistics=True,
                     use_byte_stream_split=True,
@@ -825,7 +825,7 @@ def create_optimized_parquet_export(results_df, turn_analysis_df=None):
             use_dictionary=True,
             write_statistics=True,
             use_byte_stream_split=True,
-            compression_level=6
+            
         )
         results_buffer.seek(0)
         
@@ -844,7 +844,7 @@ def create_optimized_parquet_export(results_df, turn_analysis_df=None):
                 use_dictionary=True,
                 write_statistics=True,
                 use_byte_stream_split=True,
-                compression_level=6
+                
             )
             turn_buffer.seek(0)
             export_data['turn_analysis'] = turn_buffer.getvalue()

@@ -21,7 +21,7 @@ except ImportError:
 
 # Configure page
 st.set_page_config(
-    page_title="GenCoachingIQ",
+    page_title="GENCoachingIQ",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -251,6 +251,27 @@ class CallCenterAnalyzer:
         else:
             return np.random.randint(0, 7)   # Detractors
     
+    def parse_embedded_transcript(self, text):
+        """Parse embedded timestamp-speaker format: [HH:MM:SS SPEAKER]: dialogue"""
+        if not text or pd.isna(text):
+            return []
+        
+        # Pattern to match [timestamp speaker]: dialogue
+        pattern = r'\[(\d{1,2}:\d{2}:\d{2})\s+([A-Za-z]+)\]:\s*(.*?)(?=\[\d{1,2}:\d{2}:\d{2}|$)'
+        matches = re.findall(pattern, str(text), re.DOTALL | re.IGNORECASE)
+        
+        turns = []
+        for i, match in enumerate(matches):
+            timestamp, speaker, dialogue = match
+            turns.append({
+                'turn_number': i + 1,
+                'timestamp': timestamp.strip(),
+                'speaker': speaker.strip().upper(),
+                'text': dialogue.strip()
+            })
+        
+        return turns
+    
     def identify_coaching_themes(self, text):
         """Enhanced coaching theme identification with context awareness"""
         if not text or pd.isna(text):
@@ -343,7 +364,7 @@ class CallCenterAnalyzer:
         themes = self.identify_coaching_themes(text)
         quality = self.detect_conversation_quality(text, speaker)
         
-        if speaker and speaker.lower() in ['agent', 'rep', 'representative']:
+        if speaker and speaker.upper() in ['AGENT', 'REP', 'REPRESENTATIVE']:
             # Agent-specific analysis
             coaching_focus = []
             
@@ -369,7 +390,7 @@ class CallCenterAnalyzer:
                 'quality': quality
             }
         
-        elif speaker and speaker.lower() in ['customer', 'client', 'caller']:
+        elif speaker and speaker.upper() in ['CUSTOMER', 'CLIENT', 'CALLER']:
             # Customer-specific analysis
             satisfaction_indicators = []
             
@@ -400,12 +421,12 @@ class CallCenterAnalyzer:
         }
     
     def extract_speaker_turns(self, text, timestamp_col=None, speaker_col=None):
-        """Extract turn-by-turn analysis"""
-        turns = []
+        """Extract turn-by-turn analysis from embedded format"""
+        turns = self.parse_embedded_transcript(text)
         
-        # Simple pattern matching for speaker identification if not provided
-        if speaker_col is None:
-            agent_patterns = r'(agent|rep|representative|advisor)[:|-]?\s*(.*?)(?=customer|client|caller|$)'
+        # If no embedded format found, try legacy pattern matching
+        if not turns:
+            agent_patterns = r'(agent|rep|representative)[:|-]?\s*(.*?)(?=customer|client|caller|$)'
             customer_patterns = r'(customer|client|caller|user)[:|-]?\s*(.*?)(?=agent|rep|representative|$)'
             
             agent_matches = re.findall(agent_patterns, str(text), re.IGNORECASE | re.DOTALL)
@@ -414,7 +435,7 @@ class CallCenterAnalyzer:
             for i, match in enumerate(agent_matches):
                 turns.append({
                     'turn_number': i + 1,
-                    'speaker': 'Agent',
+                    'speaker': 'AGENT',
                     'text': match[1].strip(),
                     'timestamp': f"Turn {i+1}"
                 })
@@ -422,7 +443,7 @@ class CallCenterAnalyzer:
             for i, match in enumerate(customer_matches):
                 turns.append({
                     'turn_number': i + 1,
-                    'speaker': 'Customer',
+                    'speaker': 'CUSTOMER',
                     'text': match[1].strip(),
                     'timestamp': f"Turn {i+1}"
                 })
@@ -430,31 +451,38 @@ class CallCenterAnalyzer:
         return turns
     
     def process_transcript(self, df, text_col, speaker_col=None, timestamp_col=None, parallel=False):
-        """Enhanced main processing function with detailed analysis"""
+        """Enhanced main processing function with embedded parsing"""
         results = []
         
         def process_row(row):
             text = row[text_col]
-            speaker = row.get(speaker_col, 'Unknown') if speaker_col else 'Unknown'
             
-            # Get sentiment scores
+            # Parse embedded transcript for speaker-specific analysis
+            turns = self.parse_embedded_transcript(text)
+            
+            # Overall transcript analysis
             vader_compound, vader_pos, vader_neg, textblob_pol = self.get_sentiment_scores(text)
-            
-            # Predict NPS
             nps_score = self.predict_nps(vader_compound, vader_pos, vader_neg)
-            
-            # Enhanced coaching theme analysis
             themes = self.identify_coaching_themes(text)
-            
-            # Calculate coaching priority
             coaching_priority = self.calculate_coaching_priority(themes)
             
             # Get top themes with scores
             top_themes = sorted(themes.items(), key=lambda x: x[1]['score'], reverse=True)[:3]
             top_theme = top_themes[0][0] if top_themes else 'none'
             
-            # Speaker-specific analysis
-            speaker_analysis = self.analyze_customer_agent_interaction(text, speaker)
+            # Speaker-specific analysis from parsed turns
+            agent_analysis = []
+            customer_analysis = []
+            
+            for turn in turns:
+                speaker_analysis = self.analyze_customer_agent_interaction(turn['text'], turn['speaker'])
+                if speaker_analysis['speaker_type'] == 'agent':
+                    agent_analysis.extend(speaker_analysis.get('coaching_focus', []))
+                elif speaker_analysis['speaker_type'] == 'customer':
+                    customer_analysis.extend(speaker_analysis.get('satisfaction_indicators', []))
+            
+            # Overall quality from full transcript
+            quality = self.detect_conversation_quality(text)
             
             # Format themes for display
             themes_summary = {}
@@ -466,7 +494,9 @@ class CallCenterAnalyzer:
             
             return {
                 'transcript_text': text[:200] + '...' if len(text) > 200 else text,
-                'speaker': speaker,
+                'total_turns': len(turns),
+                'agent_turns': len([t for t in turns if t['speaker'] == 'AGENT']),
+                'customer_turns': len([t for t in turns if t['speaker'] == 'CUSTOMER']),
                 'vader_compound': round(vader_compound, 3),
                 'vader_positive': round(vader_pos, 3),
                 'vader_negative': round(vader_neg, 3),
@@ -476,10 +506,11 @@ class CallCenterAnalyzer:
                 'top_coaching_theme': top_theme,
                 'theme_count': len(themes),
                 'detailed_themes': str(themes_summary),
-                'speaker_analysis': str(speaker_analysis.get('coaching_focus', [])) if speaker_analysis['speaker_type'] == 'agent' else str(speaker_analysis.get('satisfaction_indicators', [])),
-                'quality_score': speaker_analysis['quality']['quality_score'],
-                'quality_indicators': str(speaker_analysis['quality']['indicators']),
-                'timestamp': row.get(timestamp_col, 'N/A') if timestamp_col else 'N/A'
+                'agent_coaching_focus': str(agent_analysis),
+                'customer_satisfaction_indicators': str(customer_analysis),
+                'quality_score': quality['quality_score'],
+                'quality_indicators': str(quality['indicators']),
+                'conversation_duration': f"{turns[-1]['timestamp']}" if turns else 'N/A'
             }
         
         if parallel and len(df) > 100:
@@ -531,8 +562,8 @@ def load_file(uploaded_file):
         return None
 
 def main():
-    st.title("🤖 GenCoachingIQ")
-    st.markdown("*ML and AI Driven Coaching Insights Generator*")
+    st.title("🤖 GENCoachingIQ")
+    st.markdown("*AI and ML Driven Coaching Theme Generator*")
     
     # Sidebar Configuration
     with st.sidebar:
@@ -550,6 +581,14 @@ def main():
             type=['csv', 'xlsx', 'xls'],
             help="Supported formats: CSV, Excel (.xlsx, .xls)"
         )
+        
+        # Help for embedded format
+        st.subheader("📝 Transcript Format")
+        st.info("Supports embedded format: [HH:MM:SS SPEAKER]: dialogue")
+        with st.expander("Format Example"):
+            st.code("""[10:00:00 AGENT]: Hello, how can I help?
+[10:00:15 CUSTOMER]: I have an issue with my order
+[10:00:30 AGENT]: I understand your concern""")
     
     # Main content area
     if uploaded_file is not None:
@@ -567,38 +606,22 @@ def main():
         
         # Column selection
         st.subheader("🎯 Column Configuration")
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         
         with col1:
             text_column = st.selectbox(
                 "Select Text/Transcript Column",
                 options=df.columns.tolist(),
-                help="Column containing the conversation transcript"
+                help="Column containing the conversation transcript with embedded speaker/timestamp format"
             )
         
         with col2:
-            speaker_column = st.selectbox(
-                "Select Speaker Column (Optional)",
-                options=['None'] + df.columns.tolist(),
-                help="Column identifying agent vs customer"
+            # Additional columns to include
+            additional_columns = st.multiselect(
+                "Select additional columns for output",
+                options=[col for col in df.columns if col != text_column],
+                help="These columns will be included in your final export"
             )
-            speaker_column = None if speaker_column == 'None' else speaker_column
-        
-        with col3:
-            timestamp_column = st.selectbox(
-                "Select Timestamp Column (Optional)",
-                options=['None'] + df.columns.tolist(),
-                help="Column containing conversation timestamps"
-            )
-            timestamp_column = None if timestamp_column == 'None' else timestamp_column
-        
-        # Additional columns to include
-        st.subheader("📊 Additional Columns to Include in Output")
-        additional_columns = st.multiselect(
-            "Select additional columns for final output",
-            options=[col for col in df.columns if col not in [text_column, speaker_column, timestamp_column]],
-            help="These columns will be included in your final export"
-        )
         
         # Process button
         if st.button("🚀 Start Analysis", type="primary"):
@@ -607,9 +630,9 @@ def main():
             with st.spinner("Processing transcripts and analyzing coaching themes..."):
                 start_time = time.time()
                 
-                # Main analysis
+                # Main analysis with embedded parsing
                 results_df = analyzer.process_transcript(
-                    df, text_column, speaker_column, timestamp_column, parallel_processing
+                    df, text_column, parallel=parallel_processing
                 )
                 
                 # Add additional columns
@@ -646,8 +669,8 @@ def main():
                 st.metric("Critical Issues", high_priority_count)
             
             with col5:
-                total_transcripts = len(results_df)
-                st.metric("Total Transcripts", total_transcripts)
+                total_turns = results_df['total_turns'].sum()
+                st.metric("Total Conversation Turns", total_turns)
             
             # Coaching Priority Analysis
             st.subheader("🎯 Coaching Priority Breakdown")
@@ -660,7 +683,7 @@ def main():
                 if len(critical_issues) > 0:
                     st.error(f"🚨 {len(critical_issues)} transcripts require immediate coaching intervention")
                     st.dataframe(
-                        critical_issues[['speaker', 'coaching_priority_score', 'top_coaching_theme', 'speaker_analysis']].head(),
+                        critical_issues[['coaching_priority_score', 'top_coaching_theme', 'agent_coaching_focus']].head(),
                         use_container_width=True,
                         hide_index=True
                     )
@@ -673,7 +696,7 @@ def main():
                 if len(positive_examples) > 0:
                     st.success(f"⭐ {len(positive_examples)} examples of excellent performance")
                     st.dataframe(
-                        positive_examples[['speaker', 'coaching_priority_score', 'top_coaching_theme', 'quality_score']].head(),
+                        positive_examples[['coaching_priority_score', 'top_coaching_theme', 'quality_score']].head(),
                         use_container_width=True,
                         hide_index=True
                     )
@@ -681,7 +704,7 @@ def main():
                     st.info("💡 Consider highlighting positive coaching examples")
             
             # Main results table
-            st.subheader("🎯 Coaching Analysis Results")
+            st.subheader("🎯 Detailed Coaching Analysis Results")
             
             # Display options
             col1, col2, col3 = st.columns(3)
@@ -689,7 +712,7 @@ def main():
                 show_columns = st.multiselect(
                     "Select columns to display",
                     options=results_df.columns.tolist(),
-                    default=['speaker', 'predicted_nps', 'coaching_priority_score', 'top_coaching_theme', 'quality_score']
+                    default=['total_turns', 'agent_turns', 'customer_turns', 'predicted_nps', 'coaching_priority_score', 'top_coaching_theme']
                 )
             
             with col2:
@@ -726,41 +749,97 @@ def main():
                 hide_index=True
             )
             
-            # Turn-by-turn analysis if speaker column provided
-            if speaker_column and speaker_column in df.columns:
-                st.subheader("🔄 Turn-by-Turn Analysis")
-                
-                turn_results = []
-                progress_bar = st.progress(0)
-                
-                for i, row in df.iterrows():
-                    turns = analyzer.extract_speaker_turns(
-                        row[text_column], 
-                        timestamp_column, 
-                        speaker_column
-                    )
+            # Turn-by-turn analysis
+            st.subheader("🔄 Turn-by-Turn Conversation Analysis")
+            
+            if st.button("Generate Turn-by-Turn Analysis"):
+                with st.spinner("Analyzing individual conversation turns..."):
+                    analyzer = CallCenterAnalyzer()
+                    turn_results = []
+                    progress_bar = st.progress(0)
                     
-                    for turn in turns:
-                        sentiment_scores = analyzer.get_sentiment_scores(turn['text'])
-                        themes = analyzer.identify_coaching_themes(turn['text'])
+                    for i, row in df.iterrows():
+                        transcript_text = row[text_column]
+                        turns = analyzer.parse_embedded_transcript(transcript_text)
                         
-                        turn_results.append({
-                            'transcript_id': i,
-                            'turn_number': turn['turn_number'],
-                            'speaker': turn['speaker'],
-                            'text': turn['text'][:100] + '...' if len(turn['text']) > 100 else turn['text'],
-                            'sentiment': sentiment_scores[0],
-                            'coaching_themes': list(themes.keys()),
-                            'timestamp': turn['timestamp']
-                        })
-                    
-                    progress_bar.progress((i + 1) / len(df))
+                        for turn in turns:
+                            # Analyze each turn
+                            sentiment_scores = analyzer.get_sentiment_scores(turn['text'])
+                            themes = analyzer.identify_coaching_themes(turn['text'])
+                            speaker_analysis = analyzer.analyze_customer_agent_interaction(turn['text'], turn['speaker'])
+                            coaching_priority = analyzer.calculate_coaching_priority(themes)
+                            
+                            # Get top theme
+                            top_themes = sorted(themes.items(), key=lambda x: x[1]['score'], reverse=True)[:1]
+                            top_theme = top_themes[0][0] if top_themes else 'none'
+                            
+                            turn_results.append({
+                                'transcript_id': i,
+                                'turn_number': turn['turn_number'],
+                                'timestamp': turn['timestamp'],
+                                'speaker': turn['speaker'],
+                                'text_preview': turn['text'][:100] + '...' if len(turn['text']) > 100 else turn['text'],
+                                'sentiment_compound': round(sentiment_scores[0], 3),
+                                'coaching_priority': round(coaching_priority, 2),
+                                'top_theme': top_theme,
+                                'theme_count': len(themes),
+                                'speaker_analysis': str(speaker_analysis.get('coaching_focus', [])) if speaker_analysis['speaker_type'] == 'agent' else str(speaker_analysis.get('satisfaction_indicators', []))
+                            })
+                        
+                        progress_bar.progress((i + 1) / len(df))
                 
                 if turn_results:
                     turn_df = pd.DataFrame(turn_results)
                     st.session_state.turn_analysis = turn_df
+                    
+                    # Turn analysis summary
+                    st.markdown("### Turn Analysis Summary")
+                    turn_col1, turn_col2, turn_col3, turn_col4 = st.columns(4)
+                    
+                    with turn_col1:
+                        agent_turns = len(turn_df[turn_df['speaker'] == 'AGENT'])
+                        st.metric("Agent Turns", agent_turns)
+                    
+                    with turn_col2:
+                        customer_turns = len(turn_df[turn_df['speaker'] == 'CUSTOMER'])
+                        st.metric("Customer Turns", customer_turns)
+                    
+                    with turn_col3:
+                        critical_turns = len(turn_df[turn_df['coaching_priority'] < -2])
+                        st.metric("Critical Turns", critical_turns)
+                    
+                    with turn_col4:
+                        avg_turn_sentiment = turn_df['sentiment_compound'].mean()
+                        st.metric("Avg Turn Sentiment", f"{avg_turn_sentiment:.2f}")
+                    
+                    # Turn filtering options
+                    st.markdown("### Filter Turn Analysis")
+                    turn_filter_col1, turn_filter_col2 = st.columns(2)
+                    
+                    with turn_filter_col1:
+                        speaker_filter = st.selectbox(
+                            "Filter by speaker",
+                            options=['All', 'AGENT', 'CUSTOMER']
+                        )
+                    
+                    with turn_filter_col2:
+                        turn_priority_filter = st.selectbox(
+                            "Filter by turn priority",
+                            options=['All', 'Critical Turns (< -2)', 'Positive Turns (> 1)']
+                        )
+                    
+                    # Apply turn filters
+                    filtered_turns = turn_df.copy()
+                    if speaker_filter != 'All':
+                        filtered_turns = filtered_turns[filtered_turns['speaker'] == speaker_filter]
+                    
+                    if turn_priority_filter == 'Critical Turns (< -2)':
+                        filtered_turns = filtered_turns[filtered_turns['coaching_priority'] < -2]
+                    elif turn_priority_filter == 'Positive Turns (> 1)':
+                        filtered_turns = filtered_turns[filtered_turns['coaching_priority'] > 1]
+                    
                     st.dataframe(
-                        turn_df,
+                        filtered_turns,
                         use_container_width=True,
                         hide_index=True
                     )
@@ -773,14 +852,14 @@ def main():
                 # CSV export
                 csv = results_df.to_csv(index=False)
                 st.download_button(
-                    label="Download CSV",
+                    label="📊 Download Analysis CSV",
                     data=csv,
                     file_name=f"coaching_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv"
                 )
             
             with col2:
-                # Excel export
+                # Excel export with multiple sheets
                 output = BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     results_df.to_excel(writer, sheet_name='Coaching Analysis', index=False)
@@ -788,14 +867,14 @@ def main():
                         st.session_state.turn_analysis.to_excel(writer, sheet_name='Turn Analysis', index=False)
                 
                 st.download_button(
-                    label="Download Excel",
+                    label="📈 Download Excel Report",
                     data=output.getvalue(),
-                    file_name=f"coaching_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    file_name=f"coaching_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
     
     else:
-        st.info("👈 Please upload a file to get started")
+        st.info("👈 Please upload a transcript file to get started")
         
         # Help section
         with st.expander("ℹ️ How to use this app"):
@@ -803,18 +882,25 @@ def main():
             ### Step-by-Step Guide:
             
             1. **Upload File**: Upload your call transcript file (CSV, Excel)
-            2. **Configure Columns**: Select which columns contain transcript text, speaker info, and timestamps
-            3. **Choose Output Columns**: Select additional columns to include in your analysis
-            4. **Run Analysis**: Click 'Start Analysis' to process your data
+            2. **Select Text Column**: Choose the column containing embedded transcript format
+            3. **Choose Output Columns**: Select additional columns to include in analysis
+            4. **Run Analysis**: Click 'Start Analysis' to process embedded timestamps and speakers
             5. **Review Results**: Examine coaching themes, sentiment scores, and NPS predictions
-            6. **Export Data**: Download results in CSV or Excel format
+            6. **Turn Analysis**: Generate detailed turn-by-turn coaching insights
+            7. **Export Data**: Download results in CSV or Excel format
+            
+            ### Embedded Format Support:
+            - **Format**: `[HH:MM:SS SPEAKER]: dialogue text`
+            - **Example**: `[10:00:00 AGENT]: I completely understand your concern`
+            - **Speakers**: AGENT, CUSTOMER, REP, CLIENT, etc.
             
             ### Features:
-            - 🎯 **Coaching Theme Detection**: Identifies areas for improvement beyond simple keywords
+            - 🎯 **Advanced Theme Detection**: 15 coaching categories with 200+ phrases
             - 📊 **NPS Prediction**: Estimates Net Promoter Score based on conversation sentiment
             - 🔄 **Turn-by-Turn Analysis**: Analyzes agent vs customer interactions separately
             - ⚡ **Parallel Processing**: Faster analysis for large datasets
             - 💾 **Smart Caching**: Optimized performance with session caching
+            - 🎪 **Coaching Priorities**: Weighted scoring system for coaching urgency
             """)
 
 if __name__ == "__main__":

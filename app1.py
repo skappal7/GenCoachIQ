@@ -94,7 +94,7 @@ class ArrowVectorizedEngine:
                     row_group_size=20000,
                     use_compliant_nested_type=True,
                     write_statistics=True,
-                    use_byte_stream_split=True,
+                    use_byte_stream_split=False,
                     
                 )
                 parquet_buffer.seek(0)
@@ -826,7 +826,7 @@ def create_optimized_parquet_export(results_df, turn_analysis_df=None):
             compression_level=6, 
             use_dictionary=False,
             write_statistics=True,
-            use_byte_stream_split=True,
+            use_byte_stream_split=False,
             
         )
         results_buffer.seek(0)

@@ -90,7 +90,7 @@ class ArrowVectorizedEngine:
                     parquet_buffer,
                     compression='zstd',
                     compression_level=6, 
-                    use_dictionary=True,
+                    use_dictionary=False,
                     row_group_size=20000,
                     use_compliant_nested_type=True,
                     write_statistics=True,
